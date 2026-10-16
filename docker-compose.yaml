@@ -1,0 +1,101 @@
+services:
+
+  paperless-valkey:
+    image: valkey/valkey:9-alpine
+    container_name: paperless-valkey
+    restart: unless-stopped
+
+    command: valkey-server --appendonly yes
+
+    volumes:
+      - /home/pi/docker/paperless/valkey:/data
+
+    networks:
+      - bluenet
+
+  paperless:
+    image: ghcr.io/paperless-ngx/paperless-ngx:latest
+    container_name: paperless
+    restart: unless-stopped
+
+    ports:
+      - "1888:8000"
+
+    networks:
+      - bluenet
+
+    environment:
+
+      # -------------------------------------------------
+      # Verarbeitung
+      # -------------------------------------------------
+      PAPERLESS_TASK_WORKERS: "1"
+      PAPERLESS_CONSUMER_DELETE_DUPLICATES: "true"
+      # E-Mail-Abruf deaktivieren
+      PAPERLESS_EMAIL_TASK_CRON: disable
+
+      # -------------------------------------------------
+      # PostgreSQL
+      # -------------------------------------------------
+      PAPERLESS_DBENGINE: "postgresql"
+      PAPERLESS_DBHOST: "postgres"
+      PAPERLESS_DBPORT: "5432"
+      PAPERLESS_DBNAME: "${POSTGRES_DBNAME}"
+      PAPERLESS_DBUSER: "${POSTGRES_USER}"
+      PAPERLESS_DBPASS: "${POSTGRES_PASSWORD}"
+
+      # -------------------------------------------------
+      # Valkey
+      # -------------------------------------------------
+      PAPERLESS_REDIS: "redis://paperless-valkey:6379"
+
+      # -------------------------------------------------
+      # Paperless
+      # -------------------------------------------------
+      PAPERLESS_SECRET_KEY: "${PAPERLESS_SECRET_KEY}"
+
+      PAPERLESS_TIME_ZONE: "Europe/Berlin"
+
+      # -------------------------------------------------
+      # OCR
+      # -------------------------------------------------
+      PAPERLESS_OCR_LANGUAGE: "deu+eng"
+      PAPERLESS_OCR_MODE: "auto"
+      PAPERLESS_ARCHIVE_FILE_GENERATION: "always"
+
+      # -------------------------------------------------
+      # Dateinamen
+      # -------------------------------------------------
+      PAPERLESS_FILENAME_FORMAT: "{{ created_year }}/{{ correspondent }}/{{ title }}"
+
+      # -------------------------------------------------
+      # Web
+      # -------------------------------------------------
+      PAPERLESS_URL: "http://rasp2:1888"
+
+    volumes:
+
+      # Paperless Daten
+      - /media/BlueDisc3/PAPERLESS/data:/usr/src/paperless/data
+
+      # Dokumente / Media
+      - /media/BlueDisc3/PAPERLESS/media:/usr/src/paperless/media
+
+      # Eingangsordner
+      - /media/BlueDisc3/PAPERLESS/consume:/usr/src/paperless/consume
+
+      # Export
+      - /media/BlueDisc3/PAPERLESS/export:/usr/src/paperless/export
+
+      # Eigene Scripts
+      - /home/pi/docker/paperless/paperless_gdrive/scripts:/usr/src/paperless/scripts:ro
+
+      # Übergabe Archiv-PDF
+      - /media/BlueDisc3/PAPERLESS/archive_outbox:/usr/src/paperless/archive_outbox
+
+      # Statuskommunikation
+      - /home/pi/docker/paperless/paperless_gdrive/state:/usr/src/paperless/state
+
+networks:
+  bluenet:
+    external: true

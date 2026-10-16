@@ -1,0 +1,15 @@
+# Example only. Do not deploy before shared locking, permissions and LAN firewall are verified.
+services:
+  paperless-quarantine:
+    build: .
+    restart: unless-stopped
+    environment:
+      PAPERLESS_URL: http://rasp2:1888
+      PAPERLESS_STATE_DIR: /media/BlueDisc3/PAPERLESS/state
+      QUARANTINE_BIND: 0.0.0.0
+      QUARANTINE_PORT: "1889"
+      QUARANTINE_SESSION_SECRET: ${QUARANTINE_SESSION_SECRET:?set-in-local-env}
+    volumes:
+      - /media/BlueDisc3/PAPERLESS/state:/media/BlueDisc3/PAPERLESS/state
+    ports:
+      - "0.0.0.0:1889:1889"

@@ -1,0 +1,30 @@
+# Alte Projektversionen
+/ARCHIV/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Geheimnisse und lokale Umgebungsvariablen
+.env
+.env.*
+!.env.example
+*secret*
+*credentials*
+
+# Laufzeitdaten
+/valkey/appendonlydir/
+/valkey/dump.rdb
+**/state/
+**/logs/
+*.log
+*.pid
+*.lock
+*.tmp
+
+# Lokale Sicherungskopien
+*.bak
+*.bak_*
