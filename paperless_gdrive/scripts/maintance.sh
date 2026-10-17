@@ -6,16 +6,16 @@ BASE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 source "${SCRIPT_DIR}/lib/common.sh"
 source "${SCRIPT_DIR}/lib/jobs.sh"
-
+source "${SCRIPT_DIR}/lib/paperless_api.sh"
 
 # ============================================================
 # Hilfsfunktion: Wert aus job.conf lesen
 # ============================================================
 
+
 get_job_value() {
     local job_file="$1"
     local key="$2"
-
     local value
 
     value="$(
@@ -29,6 +29,15 @@ get_job_value() {
 
     value="${value#\"}"
     value="${value%\"}"
+
+    # Bash-printf-%q-Escaping rückgängig machen
+    value="${value//\\ / }"
+    value="${value//\\,/,}"
+    value="${value//\\\(/(}"
+    value="${value//\\\)/)}"
+    value="${value//\\\[/[}"
+    value="${value//\\\]/]}"
+    value="${value//\\\&/&}"
 
     printf '%s\n' "${value}"
 }
@@ -676,6 +685,96 @@ status_menu() {
 
 
 # ============================================================
+# Wiederanlauf verwaister Paperless-Jobs
+# ============================================================
+
+restart_stuck_jobs() {
+    echo
+    echo "============================================================"
+    echo " Wiederanlauf"
+    echo "============================================================"
+
+    local job_file job_id status task_uuid task_json
+    local task_status document_id source_file answer
+    local celery_active
+
+    for job_file in "${JOB_DIR}"/*/job.conf; do
+        [[ -f "${job_file}" ]] || continue
+
+        status="$(get_job_value "${job_file}" "STATUS")"
+        [[ "${status}" == "PAPERLESS_PROCESSING" ]] || continue
+
+        job_id="$(basename "$(dirname "${job_file}")")"
+        task_uuid="$(get_job_value "${job_file}" "PAPERLESS_TASK_ID")"
+        source_file="$(get_job_value "${job_file}" "SOURCE_FILE")"
+
+        echo
+        echo "Job:       ${job_id}"
+        echo "Datei:     $(get_job_value "${job_file}" "SOURCE_NAME")"
+        echo "Task:      ${task_uuid:-unbekannt}"
+
+        if [[ -z "${task_uuid}" || ! -f "${source_file}" ]]; then
+            echo "Übersprungen: Task-ID oder Quelldatei fehlt."
+            continue
+        fi
+
+        if ! task_json="$(paperless_task_json "${task_uuid}")"; then
+            echo "Übersprungen: Paperless-Task nicht abrufbar."
+            continue
+        fi
+
+        task_status="$(printf '%s\n' "${task_json}" | jq -r '.status // "unbekannt"')"
+        document_id="$(printf '%s\n' "${task_json}" | jq -r '.related_document_ids[0] // empty')"
+
+        echo "Task-Status: ${task_status}"
+        echo "Dokument-ID: ${document_id:-keine}"
+
+        if [[ -n "${document_id}" ]]; then
+            echo "Übersprungen: Paperless hat bereits ein Dokument zugeordnet."
+            continue
+        fi
+
+        # Nicht neu einreichen, wenn der Task noch aktiv bearbeitet wird.
+        if ! celery_active="$(docker exec paperless celery -A paperless inspect active --timeout=5 2>&1)"; then
+            echo "Übersprungen: Aktive Celery-Tasks konnten nicht geprüft werden."
+            continue
+        fi
+
+        if printf '%s\n' "${celery_active}" | grep -Fq "${task_uuid}"; then
+            echo "Übersprungen: Task ist noch aktiv."
+            continue
+        fi
+
+        if [[ "${task_status}" != "started" ]]; then
+            echo "Übersprungen: Task-Status ist nicht 'started'."
+            continue
+        fi
+
+        echo
+        echo "Der Task scheint verwaist zu sein."
+        read -r -p "Job auf COPIED_TO_POOL zurücksetzen? [j/N] " answer
+
+        case "${answer}" in
+            j|J|ja|JA|Ja)
+                if job_set_status "${job_id}" "COPIED_TO_POOL"; then
+                    echo "Job zurückgesetzt."
+                    echo "Die erneute Übergabe erfolgt über den regulären Workflow."
+                else
+                    echo "FEHLER: Status konnte nicht geändert werden."
+                fi
+                ;;
+            *)
+                echo "Unverändert übersprungen."
+                ;;
+        esac
+    done
+
+    echo
+    read -r -p "Weiter mit Enter..."
+}
+
+
+# ============================================================
 # Aufräumen
 # ============================================================
 
@@ -743,10 +842,11 @@ while true; do
     echo "  2) Dokumentenverarbeitung nach Status"
     echo "  3) Diagnose"
     echo "  4) Aufräumen"
+    echo "  5) Wiederanlauf"
     echo "  x) Exit"
     echo
 
-    read -r -p "Auswahl [1-4]: " choice
+    read -r -p "Auswahl [1-5]: " choice
 
     case "${choice}" in
 
@@ -767,7 +867,9 @@ while true; do
             cleanup
             read -r -p "Weiter mit Enter..."
             ;;
-
+        5)
+            restart_stuck_jobs
+            ;;
         x|X)
             echo "Exit."
             exit 0
