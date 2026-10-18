@@ -179,6 +179,8 @@ for file in "${files[@]}"; do
 
   primary="$(jq -r '.proposal.primary_tag // empty' "$file")"
   date="$(jq -r '.proposal.document_date // empty' "$file")"
+  title="$(jq -r '.proposal.title // empty' "$file")"
+  manual_approved="$(jq -r '.manual_review.approved_at // empty' "$file")"
   correspondent="$(jq -r '.proposal.correspondent // .proposal.correspondent_suggestion // empty' "$file")"
 
   [[ -n "$primary" ]] || {
@@ -267,13 +269,15 @@ for file in "${files[@]}"; do
     if ! patch="$(jq -nc \
       --argjson tags "$all_tags" \
       --arg date "$date" \
+      --arg title "$title" \
       --arg corr "$corr_id" \
-      --arg manual_approved "$(jq -r '.manual_review.approved_at // empty' "$file")" \
+      --arg manual_approved "$manual_approved" \
       --slurpfile olddoc "$doc_tmp" '
         {tags:$tags}
         + (if $date != "" then {created:$date} else {} end)
         + (if $corr != "" and ($olddoc[0].correspondent == null or $manual_approved != "")
            then {correspondent:($corr|tonumber)} else {} end)
+        + (if $title != "" and $manual_approved != "" then {title:$title} else {} end)
       ')"; then
       rm -f "$doc_tmp"
       echo "[FEHLER] Dokument $id: PATCH konnte nicht erstellt werden." >&2
@@ -303,6 +307,13 @@ for file in "${files[@]}"; do
     if [[ -n "$date" ]] &&
        [[ "$(jq -r '.created' <<< "$verified")" != "$date" ]]; then
       echo "[FEHLER] Dokument $id: Datum nicht bestätigt" >&2
+      ((count_failed+=1))
+      continue
+    fi
+
+    if [[ -n "$manual_approved" && -n "$title" ]] &&
+       [[ "$(jq -r '.title // empty' <<< "$verified")" != "$title" ]]; then
+      echo "[FEHLER] Dokument $id: Titel nicht bestätigt" >&2
       ((count_failed+=1))
       continue
     fi

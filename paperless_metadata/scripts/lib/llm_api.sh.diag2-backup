@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Einheitliche Provider-Schnittstelle. stdout: validiertes Vorschlags-JSON.
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+
+pm_llm_classify() {
+  local document_json="$1" result checked
+
+  case "$LLM_PROVIDER" in
+    gemini)
+      source "${PM_ROOT}/scripts/lib/providers/gemini.sh"
+      result="$(pm_gemini_classify "$document_json")" || {
+        echo "FEHLER: Gemini-Provider lieferte keine gültige Antwort." >&2
+        return 1
+      }
+      ;;
+    groq)
+      source "${PM_ROOT}/scripts/lib/providers/groq.sh"
+      result="$(pm_groq_classify "$document_json")" || return 1
+      ;;
+    openrouter)
+      source "${PM_ROOT}/scripts/lib/providers/openrouter.sh"
+      result="$(pm_openrouter_classify "$document_json")" || return 1
+      ;;
+    *)
+      echo "Unbekannter Anbieter: $LLM_PROVIDER" >&2
+      return 1
+      ;;
+  esac
+
+  if ! checked="$(jq -ce '
+    {
+      title: (.title // null),
+      primary_tag: (.primary_tag // null),
+      additional_tags: (.additional_tags // []),
+      correspondent: (.correspondent // null),
+      correspondent_suggestion: (.correspondent_suggestion // null),
+      document_date: (.document_date // null),
+      confidence: (.confidence // null),
+      requires_review: (.requires_review // null),
+      reason: (.reason // null)
+    }
+    | select(
+        (.title == null or (.title | type == "string"))
+        and (.primary_tag | type == "string")
+        and (.additional_tags | type == "array")
+        and (.correspondent == null or (.correspondent | type == "string"))
+        and (.correspondent_suggestion == null or (.correspondent_suggestion | type == "string"))
+        and (.document_date == null or (.document_date | type == "string"))
+        and (.confidence | type == "number" and . >= 0 and . <= 1)
+        and (.requires_review | type == "boolean")
+        and (.reason | type == "string")
+      )
+  ' <<< "$result" 2>/dev/null)"; then
+    echo "FEHLER: Gemini-Antwort erfüllt das erwartete Schema nicht." >&2
+    jq -c '
+      if type != "object" then
+        {json_type: type}
+      else
+        with_entries(.value |= type)
+      end
+    ' <<< "$result" >&2 2>/dev/null ||
+      echo "Die Antwort ist kein gültiges JSON-Objekt." >&2
+    return 1
+  fi
+
+  printf '%s\n' "$checked"
+}

@@ -16,7 +16,40 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict'
 TOKENS = {}  # session ID -> (token, expiry); not persisted, never sent to browser
 LOCK = threading.RLock()
 
-BASE = '''<!doctype html><html lang="de"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Paperless Quarantäne</title><style>body{font:16px system-ui;max-width:960px;margin:35px auto;padding:0 18px;color:#24313d}input,textarea,button{font:inherit;padding:8px;margin:5px 0;max-width:100%}input[type=text],input[type=password],textarea{width:95%}textarea{min-height:85px}article{padding:15px;border:1px solid #cbd5e1;border-radius:8px;margin:14px 0}label{display:block;margin-top:10px}button{cursor:pointer}small{color:#64748b}a{color:#1261a0}</style><h1>Paperless – Quarantäne</h1>{% if logged %}<p><a href="{{url_for('index')}}">Übersicht</a> · <a href="{{url_for('logout')}}">Abmelden</a></p>{% endif %}{{body|safe}}</html>'''
+BASE = '''<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paperless – Quarantäne</title>
+<style>
+:root{--ink:#263746;--blue:#1769aa;--bg:#f1f5f9;--line:#d7e0e8;--muted:#64748b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,sans-serif}
+header{background:var(--ink);color:white;padding:15px max(20px,calc((100% - 960px)/2))}
+header h1{font-size:21px;margin:0;font-weight:600}
+nav{max-width:960px;margin:14px auto 0;padding:0 18px}
+nav a{margin-right:16px;color:var(--blue);text-decoration:none;font-weight:500}
+main{max-width:960px;margin:20px auto 45px;padding:0 18px}
+h2{font-size:21px;margin:0 0 12px}
+p{margin:8px 0 14px}
+article{background:#fff;border:1px solid var(--line);border-radius:8px;padding:20px;margin:14px 0;box-shadow:0 1px 2px #0f172a0a}
+label{display:block;font-weight:600;margin-top:14px}
+input,textarea,button{font:inherit;max-width:100%;border-radius:5px}
+input,textarea{display:block;width:100%;padding:10px 11px;margin-top:5px;border:1px solid #b8c5d1;background:#fff;color:var(--ink)}
+input:focus,textarea:focus{outline:2px solid #93c5fd;border-color:var(--blue)}
+button,.button{display:inline-block;border:0;background:var(--blue);color:#fff;padding:10px 16px;margin-top:18px;font-weight:600;text-decoration:none;cursor:pointer}
+button:hover,.button:hover{background:#12558b}
+small,.muted{color:var(--muted)}
+a{color:var(--blue)}
+@media(max-width:600px){main{padding:0 12px}article{padding:15px}header{padding:14px 16px}}
+</style>
+</head>
+<body>
+<header><h1>Paperless – Quarantäne</h1></header>
+{% if logged %}<nav><a href="{{url_for('index')}}">Übersicht</a><a href="{{url_for('logout')}}">Abmelden</a></nav>{% endif %}
+<main>{{body|safe}}</main>
+</body></html>'''
 
 def page(body, **kwargs):
     return render_template_string(BASE, body=render_template_string(body, **kwargs), logged=bool(session.get('sid')))
@@ -132,6 +165,8 @@ def review(did):
             csrf()
             primary=request.form.get('primary','').strip()
             if not primary or len(primary)>120:abort(400)
+            title=request.form.get('title','').strip()
+            if not title or len(title)>160:abort(400)
             tags=[x.strip() for x in request.form.get('tags','').split(',') if x.strip()]
             if len(tags)>30 or any(len(t)>120 for t in tags):abort(400)
             corr=request.form.get('correspondent','').strip()
@@ -142,7 +177,7 @@ def review(did):
                     if date_type.fromisoformat(date_value).isoformat() != date_value: abort(400)
                 except ValueError:
                     abort(400)
-            prop.update(primary_tag=primary,additional_tags=tags,correspondent_suggestion=corr or None,document_date=date_value,requires_review=False,review_decision='no_check_needed',validation_warnings=[])
+            prop.update(title=title,primary_tag=primary,additional_tags=tags,correspondent_suggestion=corr or None,document_date=date_value,requires_review=False,review_decision='no_check_needed',validation_warnings=[])
             shared_lock = archive_cron_lock()
             if shared_lock is None:
                 return page("""<p>Die Archivierung läuft gerade. Bitte in wenigen Sekunden erneut versuchen.</p><p><a href="{{url_for('review',did=did)}}">Zurück zur Prüfung</a></p>""", did=did), 409
@@ -166,7 +201,7 @@ def review(did):
                 fcntl.flock(shared_lock.fileno(), fcntl.LOCK_UN)
                 shared_lock.close()
             return redirect(url_for('index'))
-    return page('''<article><h2>Dokument {{did}}</h2><p>{{prop.reason}}</p><p><a href="{{url_for('preview',did=did)}}" target="_blank">Dokumentvorschau öffnen</a></p><form method="post"><input type="hidden" name="csrf" value="{{csrf}}"><label>Hauptkategorie<input name="primary" value="{{prop.primary_tag or ''}}" required></label><label>Weitere Tags (kommagetrennt)<input name="tags" value="{{(prop.additional_tags or [])|join(', ')}}"></label><label>Korrespondent<input name="correspondent" value="{{prop.correspondent_suggestion or prop.correspondent or ''}}"></label><label>Dokumentdatum YYYY-MM-DD (optional)<input name="date" value="{{prop.document_date or ''}}"></label><button type="submit">Korrigieren und freigeben</button></form></article>''',did=did,prop=prop,csrf=session['csrf'])
+    return page('''<article><h2>Dokument {{did}}</h2><p>{{prop.reason}}</p><p><a href="{{url_for('preview',did=did)}}" target="_blank">Dokumentvorschau öffnen</a></p><form method="post"><input type="hidden" name="csrf" value="{{csrf}}"><label>Dokumenttitel<input name="title" type="text" maxlength="160" value="{{prop.title or data.get('existing', {}).get('title', '')}}" required></label><label>Hauptkategorie<input name="primary" value="{{prop.primary_tag or ''}}" required></label><label>Weitere Tags (kommagetrennt)<input name="tags" value="{{(prop.additional_tags or [])|join(', ')}}"></label><label>Korrespondent<input name="correspondent" value="{{prop.correspondent_suggestion or prop.correspondent or ''}}"></label><label>Dokumentdatum YYYY-MM-DD (optional)<input name="date" value="{{prop.document_date or ''}}"></label><button type="submit">Korrigieren und freigeben</button></form></article>''',did=did,prop=prop,data=data,csrf=session['csrf'])
 
 @app.route('/preview/<int:did>')
 @require_login

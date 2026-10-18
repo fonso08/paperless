@@ -213,9 +213,18 @@ Bezeichnungen aus dem Abschnitt "Verbindliche Hauptkategorien".
 - Wenn kein Datum sicher erkennbar ist, gib null zurück.
 - Format: YYYY-MM-DD.
 
+## Dokumenttitel
+- Schlage einen kurzen, aussagekräftigen deutschen Titel vor, der den tatsächlichen Inhalt beschreibt.
+- Verwende möglichst Dokumenttyp und konkreten Gegenstand, zum Beispiel "Jahresabrechnung Wasser", "Kündigungsbestätigung", "Schulbuchrechnung" oder "Gebührenbescheid".
+- Übernimm nicht einfach den Scan-Dateinamen oder einen technisch erzeugten Dateinamen als Titel.
+- Erfinde keine Angaben und ergänze keine Details, die nicht aus dem Dokumentinhalt hervorgehen.
+- Wenn der OCR-Inhalt leer oder für einen verlässlichen Titel nicht aussagekräftig genug ist, gib für title null zurück.
+- Der Titel soll knapp sein und keine Hauptkategorie, kein Korrespondentenfeld und kein Datum künstlich wiederholen.
+
 ## Ausgabe
 Gib ausschließlich gültiges JSON mit genau diesen Schlüsseln zurück:
 {
+  "title": "string oder null",
   "primary_tag": "string",
   "additional_tags": ["string"],
   "correspondent": "string oder null",

@@ -134,6 +134,9 @@ while IFS= read -r id; do
 
   # Gemini-Ausgabe auf Pflichtfelder und Prüfregel kontrollieren.
   if ! jq -e '
+      has("title") and
+      (.title == null or
+        (.title | type == "string" and length > 0 and length <= 160)) and
       (.primary_tag | type == "string") and
       (.additional_tags | type == "array") and
       (.correspondent == null or (.correspondent | type == "string")) and
