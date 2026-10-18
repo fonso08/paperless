@@ -34,6 +34,12 @@ main{max-width:960px;margin:20px auto 45px;padding:0 18px}
 h2{font-size:21px;margin:0 0 12px}
 p{margin:8px 0 14px}
 article{background:#fff;border:1px solid var(--line);border-radius:8px;padding:20px;margin:14px 0;box-shadow:0 1px 2px #0f172a0a}
+.gemini-info{margin:18px 0;padding:14px;background:#f8fafc;border:1px solid var(--line);border-radius:6px}
+.gemini-info h3{margin:0 0 8px;font-size:16px}
+.gemini-info dl{display:grid;grid-template-columns:minmax(150px,1fr) 2fr;gap:5px 12px;margin:0}
+.gemini-info dt{color:var(--muted)}
+.gemini-info dd{margin:0;font-weight:600;overflow-wrap:anywhere}
+@media(max-width:480px){.gemini-info dl{grid-template-columns:1fr;gap:0}.gemini-info dd{margin-bottom:8px}}
 label{display:block;font-weight:600;margin-top:14px}
 input,textarea,button{font:inherit;max-width:100%;border-radius:5px}
 input,textarea{display:block;width:100%;padding:10px 11px;margin-top:5px;border:1px solid #b8c5d1;background:#fff;color:var(--ink)}
@@ -201,7 +207,15 @@ def review(did):
                 fcntl.flock(shared_lock.fileno(), fcntl.LOCK_UN)
                 shared_lock.close()
             return redirect(url_for('index'))
-    return page('''<article><h2>Dokument {{did}}</h2><p>{{prop.reason}}</p><p><a href="{{url_for('preview',did=did)}}" target="_blank">Dokumentvorschau öffnen</a></p><form method="post"><input type="hidden" name="csrf" value="{{csrf}}"><label>Dokumenttitel<input name="title" type="text" maxlength="160" value="{{prop.title or data.get('existing', {}).get('title', '')}}" required></label><label>Hauptkategorie<input name="primary" value="{{prop.primary_tag or ''}}" required></label><label>Weitere Tags (kommagetrennt)<input name="tags" value="{{(prop.additional_tags or [])|join(', ')}}"></label><label>Korrespondent<input name="correspondent" value="{{prop.correspondent_suggestion or prop.correspondent or ''}}"></label><label>Dokumentdatum YYYY-MM-DD (optional)<input name="date" value="{{prop.document_date or ''}}"></label><button type="submit">Korrigieren und freigeben</button></form></article>''',did=did,prop=prop,data=data,csrf=session['csrf'])
+    return page('''<article><h2>Dokument {{did}}</h2><p>{{prop.reason}}</p><p><a href="{{url_for('preview',did=did)}}" target="_blank">Dokumentvorschau öffnen</a></p>
+<section class="gemini-info" aria-label="Gemini-Bewertung">
+<h3>Gemini-Bewertung</h3>
+<dl>
+<dt>Confidence</dt><dd>{{ '%.2f'|format(prop.confidence) if prop.confidence is number else 'nicht vorhanden' }}</dd>
+<dt>requires_review</dt><dd>{{ prop.requires_review if prop.requires_review is defined else 'nicht vorhanden' }}</dd>
+<dt>review_decision</dt><dd>{{ prop.review_decision or 'nicht vorhanden' }}</dd>
+</dl>
+</section><form method="post"><input type="hidden" name="csrf" value="{{csrf}}"><label>Dokumenttitel<input name="title" type="text" maxlength="160" value="{{prop.title or data.get('existing', {}).get('title', '')}}" required></label><label>Hauptkategorie<input name="primary" value="{{prop.primary_tag or ''}}" required></label><label>Weitere Tags (kommagetrennt)<input name="tags" value="{{(prop.additional_tags or [])|join(', ')}}"></label><label>Korrespondent<input name="correspondent" value="{{prop.correspondent_suggestion or prop.correspondent or ''}}"></label><label>Dokumentdatum YYYY-MM-DD (optional)<input name="date" value="{{prop.document_date or ''}}"></label><button type="submit">Korrigieren und freigeben</button></form></article>''',did=did,prop=prop,data=data,csrf=session['csrf'])
 
 @app.route('/preview/<int:did>')
 @require_login

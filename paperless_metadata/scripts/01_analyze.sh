@@ -200,7 +200,7 @@ while IFS= read -r id; do
     | .review_decision =
         if .requires_review == true
         then "manual_check"
-        elif .confidence < 0.7
+        elif .confidence < 0.85
         then "inconclusive"
         else "no_check_needed"
         end

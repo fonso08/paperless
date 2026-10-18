@@ -128,6 +128,7 @@ else
       .applied != true and
       .proposal.requires_review == false and
       .proposal.review_decision == "no_check_needed" and
+      (.proposal.confidence | type == "number" and . >= 0.85) and
       ((.proposal.validation_warnings // []) | length == 0)
     ' "$candidate" >/dev/null 2>&1 || continue
 
@@ -170,6 +171,11 @@ for file in "${files[@]}"; do
     continue
   fi
 
+  if ! jq -e '(.proposal.confidence | type == "number" and . >= 0.85)' "$file" >/dev/null 2>&1; then
+    echo "[SKIP] Dokument $id: Konfidenz fehlt oder liegt unter 0.85"
+    ((count_review+=1))
+    continue
+  fi
   warnings="$(jq -r '(.proposal.validation_warnings // []) | length' "$file")"
   if [[ "$warnings" != "0" ]]; then
     echo "[SKIP] Dokument $id: Validierungswarnungen vorhanden"
