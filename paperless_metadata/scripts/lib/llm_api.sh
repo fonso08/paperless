@@ -33,7 +33,11 @@ pm_llm_classify() {
       if (.title != null and ((.title | type) != "string" or (.title | length) > 160)) then "title ungültig" else empty end,
       if ((.primary_tag | type) != "string" or (.primary_tag | length) == 0) then "primary_tag fehlt oder ist kein String" else empty end,
       if ((.additional_tags | type) != "array") then "additional_tags ist kein Array" else empty end,
-      if (.correspondent != null and (.correspondent | type) != "string") then "correspondent ungültig" else empty end,
+#      if (.correspondent != null and (.correspondent | type) != "string") then "correspondent ungültig" else empty end,
+      if (.correspondent != null and (.correspondent | type) != "string")
+            then ("correspondent ungültig: Typ=" + (.correspondent | type) + ", Wert=" + (.correspondent | tostring))
+      else empty
+      end,
       if (.correspondent_suggestion != null and (.correspondent_suggestion | type) != "string") then "correspondent_suggestion ungültig" else empty end,
       if (.document_date != null and (.document_date | type) != "string") then "document_date ungültig" else empty end,
       if (.confidence | type) != "number" or .confidence < 0 or .confidence > 1 then "confidence ungültig" else empty end,

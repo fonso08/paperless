@@ -205,6 +205,10 @@ Bezeichnungen aus dem Abschnitt "Verbindliche Hauptkategorien".
 - Übernimm den Namen so, wie er im Dokument belegt ist. Erfinde keine Rechtsformen, Firmennamen oder Absender.
 - Verwechsle Stadtverwaltung, Stadtwerke und andere Unternehmen nicht.
 - Bei mehreren Organisationen wähle den Aussteller des Dokuments.
+- existing_correspondents enthält Objekte mit den Feldern id und name.
+- Verwende id ausschließlich zur internen Identifikation des passenden Eintrags.
+- Gib im Feld correspondent immer den exakten Wert aus name zurück, niemals die numerische id.
+- Beispiel: Für {"id": 184, "name": "Stadtwerke Ratingen GmbH"} muss correspondent den String "Stadtwerke Ratingen GmbH" enthalten, nicht die Zahl 184.
 
 ## Dokumentdatum
 - Verwende das belegte Ausstellungs-, Rechnungs- oder Bescheiddatum.

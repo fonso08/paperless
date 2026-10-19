@@ -11,6 +11,9 @@ services:
       QUARANTINE_SESSION_SECRET: "${QUARANTINE_SESSION_SECRET:?Sitzungsschlüssel fehlt in .env}"
     volumes:
       - /media/BlueDisc3/PAPERLESS/state:/media/BlueDisc3/PAPERLESS/state
+      - /home/pi/docker/paperless/quarantine_web/app.py:/app/app.py:ro
+      - /home/pi/docker/paperless/paperless_metadata:/home/pi/docker/paperless/paperless_metadata:ro
+      - /media/BlueDisc3/logs:/media/BlueDisc3/logs
     ports:
       - "0.0.0.0:1889:1889"
     networks:

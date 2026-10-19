@@ -826,6 +826,300 @@ cleanup() {
     esac
 }
 
+# ============================================================
+# Proposals verwalten
+# ============================================================
+
+PROPOSAL_DIR="${PROPOSAL_DIR:-/media/BlueDisc3/PAPERLESS/state/metadata/proposals}"
+
+# Prüft das Proposal-Verzeichnis und sucht ein Proposal anhand
+# der Dokument-ID oder des Dateinamens.
+find_proposal_file() {
+    local wanted="$1"
+    local file
+    local document_id
+
+    [[ -d "${PROPOSAL_DIR}" ]] || return 1
+
+    for file in "${PROPOSAL_DIR}"/*.json; do
+        [[ -f "${file}" ]] || continue
+
+        if [[ "$(basename "${file}")" == "${wanted}" ||
+              "$(basename "${file}" .json)" == "${wanted}" ]]; then
+            printf '%s\n' "${file}"
+            return 0
+        fi
+
+        document_id="$(jq -r '.document_id // empty' "${file}" 2>/dev/null)" ||
+            continue
+
+        if [[ "${document_id}" == "${wanted}" ]]; then
+            printf '%s\n' "${file}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+
+# ------------------------------------------------------------
+# 6.1 Alle Proposals auflisten
+# ------------------------------------------------------------
+
+show_proposals() {
+    local file
+    local count=0
+
+    echo
+    echo "============================================================"
+    echo " Proposals – Übersicht"
+    echo "============================================================"
+
+    if [[ ! -d "${PROPOSAL_DIR}" ]]; then
+        echo "[FEHLER] Proposal-Verzeichnis nicht gefunden:"
+        echo "         ${PROPOSAL_DIR}"
+        echo
+        return 1
+    fi
+
+    printf '%-8s %-9s %-24s %-24s %-12s %-8s %s\n' \
+        "Dok-ID" "Applied" "Hauptkategorie" "Korrespondent" \
+        "Datum" "Conf." "Titel"
+
+    echo "------------------------------------------------------------------------------------------------"
+
+    for file in "${PROPOSAL_DIR}"/*.json; do
+        [[ -f "${file}" ]] || continue
+
+        if ! jq -e 'type == "object"' "${file}" >/dev/null 2>&1; then
+            printf '%-8s %-9s %s\n' "?" "FEHLER" "$(basename "${file}")"
+            continue
+        fi
+
+        jq -r '
+            [
+                (.document_id // "?"),
+                (if .applied == true then "ja" else "nein" end),
+                (.proposal.primary_tag // .primary_tag // "-"),
+                (.proposal.correspondent // .correspondent // "-"),
+                (.proposal.document_date // .document_date // "-"),
+                ((.proposal.confidence // .confidence // null)
+                    | if . == null then "-" else tostring end),
+                (.proposal.title // .title // "-")
+            ]
+            | map(tostring | gsub("[\t\r\n]"; " "))
+            | @tsv
+        ' "${file}" |
+        while IFS=$'\t' read -r id applied category correspondent date confidence title; do
+            printf '%-8s %-9s %-24.24s %-24.24s %-12s %-8s %s\n' \
+                "${id}" "${applied}" "${category}" "${correspondent}" \
+                "${date}" "${confidence}" "${title}"
+        done
+
+        count=$((count + 1))
+    done
+
+    echo
+    echo "Proposal-Verzeichnis: ${PROPOSAL_DIR}"
+    echo "Hinweis: Die Übersicht zeigt die wichtigsten Felder."
+    echo
+}
+
+
+# ------------------------------------------------------------
+# 6.2 Einzelnes Proposal anzeigen
+# ------------------------------------------------------------
+
+show_one_proposal() {
+    local wanted
+    local file
+
+    read -r -p "Dokument-ID oder Proposal-Dateiname: " wanted
+
+    if [[ -z "${wanted}" ]]; then
+        echo "Keine Auswahl."
+        return
+    fi
+
+    if ! file="$(find_proposal_file "${wanted}")"; then
+        echo "[FEHLER] Kein Proposal für '${wanted}' gefunden."
+        return
+    fi
+
+    echo
+    echo "============================================================"
+    echo " Proposal: $(basename "${file}")"
+    echo "============================================================"
+
+    if ! jq . "${file}"; then
+        echo "[FEHLER] Proposal enthält kein gültiges JSON."
+    fi
+
+    echo
+}
+
+
+# ------------------------------------------------------------
+# 6.3 Applied-Status zurücksetzen
+# ------------------------------------------------------------
+
+reset_proposal_applied() {
+    local wanted
+    local file
+    local answer
+    local temp_file
+    local backup_file
+
+    read -r -p "Dokument-ID oder Proposal-Dateiname: " wanted
+
+    if [[ -z "${wanted}" ]]; then
+        echo "Keine Auswahl."
+        return
+    fi
+
+    if ! file="$(find_proposal_file "${wanted}")"; then
+        echo "[FEHLER] Kein Proposal für '${wanted}' gefunden."
+        return
+    fi
+
+    if ! jq -e 'type == "object"' "${file}" >/dev/null 2>&1; then
+        echo "[FEHLER] Ungültiges Proposal-JSON: ${file}"
+        return
+    fi
+
+    echo
+    echo "Ausgewähltes Proposal: ${file}"
+    jq '{
+        document_id,
+        title: (.proposal.title // .title // null),
+        applied: (.applied // false),
+        applied_at: (.applied_at // null)
+    }' "${file}"
+
+    if [[ "$(jq -r '.applied // false' "${file}")" != "true" ]]; then
+        echo
+        echo "Hinweis: Das Proposal ist bereits nicht als applied markiert."
+        echo "Es wird nichts geändert."
+        return
+    fi
+
+    echo
+    echo "Es werden nur diese Felder geändert:"
+    echo "  applied    = false"
+    echo "  applied_at = null"
+    echo
+    echo "Das Paperless-Dokument wird NICHT geändert."
+    echo "Das Proposal wird NICHT automatisch erneut angewendet."
+    echo
+
+    read -r -p "Applied-Status wirklich zurücksetzen? [j/N] " answer
+
+    case "${answer}" in
+        j|J|ja|JA|Ja) ;;
+        *)
+            echo "Abgebrochen. Keine Änderung."
+            return
+            ;;
+    esac
+
+    # Sicherung vor jeder Änderung
+    backup_file="${file}.bak.$(date +%Y%m%d_%H%M%S)"
+
+    if ! cp -p -- "${file}" "${backup_file}"; then
+        echo "[FEHLER] Backup konnte nicht erstellt werden."
+        return 1
+    fi
+
+    temp_file="$(mktemp "${file}.tmp.XXXXXX")" || {
+        echo "[FEHLER] Temporäre Datei konnte nicht erstellt werden."
+        return 1
+    }
+
+    if ! jq '
+        .applied = false
+        | .applied_at = null
+    ' "${file}" > "${temp_file}"; then
+        rm -f -- "${temp_file}"
+        echo "[FEHLER] Proposal konnte nicht bearbeitet werden."
+        echo "Originaldatei bleibt unverändert."
+        return 1
+    fi
+
+    # Ergebnis validieren, bevor das Original ersetzt wird
+    if ! jq -e '
+        type == "object"
+        and .applied == false
+        and .applied_at == null
+    ' "${temp_file}" >/dev/null; then
+        rm -f -- "${temp_file}"
+        echo "[FEHLER] Validierung fehlgeschlagen."
+        echo "Originaldatei bleibt unverändert."
+        return 1
+    fi
+
+    chmod --reference="${file}" "${temp_file}" 2>/dev/null || true
+
+    if ! mv -- "${temp_file}" "${file}"; then
+        rm -f -- "${temp_file}"
+        echo "[FEHLER] Proposal-Datei konnte nicht ersetzt werden."
+        echo "Backup: ${backup_file}"
+        return 1
+    fi
+
+    echo
+    echo "[OK] Applied-Status zurückgesetzt."
+    echo "Backup: ${backup_file}"
+    echo
+}
+
+
+# ------------------------------------------------------------
+# Proposals-Untermenü
+# ------------------------------------------------------------
+
+proposals_menu() {
+    local choice
+
+    while true; do
+        clear
+
+        echo "============================================================"
+        echo " Proposals"
+        echo "============================================================"
+        echo
+        echo "  1) Alle Proposals auflisten"
+        echo "  2) Einzelnes Proposal anzeigen"
+        echo "  3) Applied-Status zurücksetzen"
+        echo "  4) Zurück"
+        echo
+
+        read -r -p "Auswahl [1-4]: " choice
+
+        case "${choice}" in
+            1)
+                show_proposals
+                read -r -p "Weiter mit Enter..."
+                ;;
+            2)
+                show_one_proposal
+                read -r -p "Weiter mit Enter..."
+                ;;
+            3)
+                reset_proposal_applied
+                read -r -p "Weiter mit Enter..."
+                ;;
+            4)
+                return
+                ;;
+            *)
+                echo "Ungültige Auswahl."
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 
 # ============================================================
 # Hauptmenü
@@ -835,7 +1129,7 @@ while true; do
     clear
 
     echo "============================================================"
-    echo " Paperless-Google-Drive Wartung"
+    echo " Paperless Wartung"
     echo "============================================================"
     echo
     echo "  1) Jobs und Status anzeigen"
@@ -843,26 +1137,23 @@ while true; do
     echo "  3) Diagnose"
     echo "  4) Aufräumen"
     echo "  5) Wiederanlauf"
+    echo "  6) Proposals"
     echo "  x) Exit"
     echo
 
-    read -r -p "Auswahl [1-5]: " choice
+    read -r -p "Auswahl [1-6/x]: " choice
 
     case "${choice}" in
-
         1)
             show_jobs
             read -r -p "Weiter mit Enter..."
             ;;
-
         2)
             status_menu
             ;;
-
         3)
             diagnostic_menu
             ;;
-
         4)
             cleanup
             read -r -p "Weiter mit Enter..."
@@ -870,11 +1161,13 @@ while true; do
         5)
             restart_stuck_jobs
             ;;
+        6)
+            proposals_menu
+            ;;
         x|X)
             echo "Exit."
             exit 0
             ;;
-
         *)
             echo
             echo "Ungültige Auswahl."

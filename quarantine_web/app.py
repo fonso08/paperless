@@ -1,20 +1,58 @@
-"""Quarantine review UI. Run only on a trusted LAN; use a TLS reverse proxy if needed."""
-import os, secrets, time, json, re, tempfile, threading, fcntl
+#!/usr/bin/env python3
+"""Paperless quarantine review UI.
+
+Run only on a trusted LAN; use a TLS reverse proxy if needed.
+"""
+import os
+import secrets
+import time
+import json
+import re
+import tempfile
+import threading
+import fcntl
+import subprocess
 from datetime import date as date_type
 from pathlib import Path
 from functools import wraps
-import requests
-from flask import Flask, request, session, redirect, url_for, abort, render_template_string, Response
 
-ROOT = Path(os.environ.get('PAPERLESS_STATE_DIR', '/media/BlueDisc3/PAPERLESS/state'))
+import requests
+from flask import (
+    Flask, request, session, redirect, url_for, abort,
+    render_template_string, Response
+)
+
+ROOT = Path(os.environ.get(
+    'PAPERLESS_STATE_DIR',
+    '/media/BlueDisc3/PAPERLESS/state'
+))
 PROPOSALS = ROOT / 'metadata' / 'proposals'
 JOBS = ROOT / 'jobs'
-PAPERLESS = os.environ.get('PAPERLESS_URL', 'http://rasp2:1888').rstrip('/')
+BACKUPS = ROOT / 'metadata' / 'applied_backups'
+
+PAPERLESS = os.environ.get(
+    'PAPERLESS_URL',
+    'http://rasp2:1888'
+).rstrip('/')
+
+APPLY_SCRIPT = Path(os.environ.get(
+    'PAPERLESS_METADATA_APPLY_SCRIPT',
+    '/home/pi/docker/paperless/paperless_metadata/scripts/03_apply_proposals.sh'
+))
+
 app = Flask(__name__)
 app.secret_key = os.environ['QUARANTINE_SESSION_SECRET']
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict', PERMANENT_SESSION_LIFETIME=1800)
-TOKENS = {}  # session ID -> (token, expiry); not persisted, never sent to browser
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Strict',
+    PERMANENT_SESSION_LIFETIME=1800
+)
+
+# Session-ID -> (Paperless token, expiry)
+# Tokens are never persisted or sent to the browser.
+TOKENS = {}
 LOCK = threading.RLock()
+
 
 BASE = '''<!doctype html>
 <html lang="de">
@@ -39,7 +77,6 @@ article{background:#fff;border:1px solid var(--line);border-radius:8px;padding:2
 .gemini-info dl{display:grid;grid-template-columns:minmax(150px,1fr) 2fr;gap:5px 12px;margin:0}
 .gemini-info dt{color:var(--muted)}
 .gemini-info dd{margin:0;font-weight:600;overflow-wrap:anywhere}
-@media(max-width:480px){.gemini-info dl{grid-template-columns:1fr;gap:0}.gemini-info dd{margin-bottom:8px}}
 label{display:block;font-weight:600;margin-top:14px}
 input,textarea,button{font:inherit;max-width:100%;border-radius:5px}
 input,textarea{display:block;width:100%;padding:10px 11px;margin-top:5px;border:1px solid #b8c5d1;background:#fff;color:var(--ink)}
@@ -48,183 +85,732 @@ button,.button{display:inline-block;border:0;background:var(--blue);color:#fff;p
 button:hover,.button:hover{background:#12558b}
 small,.muted{color:var(--muted)}
 a{color:var(--blue)}
+.status-error{padding:12px;background:#fff1f2;border:1px solid #fecdd3;border-radius:6px}
+.status-ok{padding:12px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:480px;overflow:auto;background:#f8fafc;padding:12px;border:1px solid var(--line);border-radius:6px}
+@media(max-width:480px){.gemini-info dl{grid-template-columns:1fr;gap:0}.gemini-info dd{margin-bottom:8px}}
 @media(max-width:600px){main{padding:0 12px}article{padding:15px}header{padding:14px 16px}}
 </style>
 </head>
 <body>
 <header><h1>Paperless – Quarantäne</h1></header>
-{% if logged %}<nav><a href="{{url_for('index')}}">Übersicht</a><a href="{{url_for('logout')}}">Abmelden</a></nav>{% endif %}
+{% if logged %}
+<nav>
+<a href="{{url_for('index')}}">Übersicht</a>
+<a href="{{url_for('reapply')}}">Dokument erneut anwenden</a>
+<a href="{{url_for('logout')}}">Abmelden</a>
+</nav>
+{% endif %}
 <main>{{body|safe}}</main>
-</body></html>'''
+</body>
+</html>'''
+
 
 def page(body, **kwargs):
-    return render_template_string(BASE, body=render_template_string(body, **kwargs), logged=bool(session.get('sid')))
+    return render_template_string(
+        BASE,
+        body=render_template_string(body, **kwargs),
+        logged=bool(session.get('sid'))
+    )
+
 
 def require_login(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        sid=session.get('sid')
+        sid = session.get('sid')
         with LOCK:
-            token, expiry = TOKENS.get(sid, ('', 0))
-        if not token or expiry < time.time():
+            token_value, expiry = TOKENS.get(sid, ('', 0))
+
+        if not token_value or expiry < time.time():
             session.clear()
             return redirect(url_for('login'))
+
         return fn(*args, **kwargs)
     return wrapper
+
 
 def token():
     return TOKENS[session['sid']][0]
 
+
 def csrf():
-    if not secrets.compare_digest(request.form.get('csrf',''), session.get('csrf','')):
+    if not secrets.compare_digest(
+        request.form.get('csrf', ''),
+        session.get('csrf', '')
+    ):
         abort(403)
 
+
 def read_job(path):
-    data={}
+    data = {}
     for line in path.read_text().splitlines():
         if '=' in line:
-            k,v=line.split('=',1)
-            if k in ('STATUS','PAPERLESS_DOCUMENT_ID','JOB_ID'):
-                data[k]=v.strip().strip("'\"")
+            key, value = line.split('=', 1)
+            if key in ('STATUS', 'PAPERLESS_DOCUMENT_ID', 'JOB_ID'):
+                data[key] = value.strip().strip("'\"")
     return data
+
 
 def job_for_doc(doc_id):
     for path in JOBS.glob('*/job.conf'):
-        data=read_job(path)
-        if data.get('PAPERLESS_DOCUMENT_ID')==str(doc_id) and data.get('STATUS')=='QUARANTINE':
+        data = read_job(path)
+        if (
+            data.get('PAPERLESS_DOCUMENT_ID') == str(doc_id)
+            and data.get('STATUS') == 'QUARANTINE'
+        ):
             return path
     return None
 
+
 def save_json(path, data):
-    path.parent.mkdir(parents=True,exist_ok=True)
-    fd,tmp=tempfile.mkstemp(dir=path.parent,prefix='.review-',suffix='.json')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        dir=path.parent,
+        prefix='.review-',
+        suffix='.json'
+    )
     try:
-        with os.fdopen(fd,'w') as f:
-            json.dump(data,f,ensure_ascii=False,indent=2)
-            f.flush();os.fsync(f.fileno())
-        os.replace(tmp,path)
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
     finally:
-        if os.path.exists(tmp):os.unlink(tmp)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def archive_cron_lock():
-    """Share the same flock as script 03 so review writes cannot race the archiver."""
+    """Share the flock used by the archive process."""
     lock_path = ROOT / '.03_archive_to_gdrive.sh.lock'
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(lock_path, 'a+')
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(
+            handle.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB
+        )
     except BlockingIOError:
         handle.close()
         return None
     return handle
 
-@app.route('/login', methods=['GET','POST'])
+
+def paperless_document(doc_id):
+    response = requests.get(
+        f'{PAPERLESS}/api/documents/{doc_id}/',
+        headers={'Authorization': 'Token ' + token()},
+        timeout=30
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def load_proposal(doc_id):
+    path = PROPOSALS / f'{doc_id}.json'
+    if not path.is_file():
+        raise FileNotFoundError(
+            f'Proposal für Dokument {doc_id} nicht gefunden.'
+        )
+
+    data = json.loads(path.read_text(encoding='utf-8'))
+
+    if str(data.get('document_id', '')) != str(doc_id):
+        raise ValueError(
+            'Die Dokumenten-ID in der Proposal-Datei stimmt nicht überein.'
+        )
+
+    if not isinstance(data.get('proposal'), dict):
+        raise ValueError('Die Proposal-Daten sind ungültig.')
+
+    return path, data
+
+
+@app.route('/login', methods=['GET', 'POST'])
 def login():
-    error=''
-    if request.method=='POST':
+    error = ''
+
+    if request.method == 'POST':
         try:
-            resp=requests.post(PAPERLESS+'/api/token/',json={'username':request.form['username'],'password':request.form['password']},timeout=15)
-            resp.raise_for_status()
-            api_token=resp.json().get('token','')
-            if not api_token: raise ValueError('Kein Token')
-            sid=secrets.token_urlsafe(32)
-            with LOCK:TOKENS[sid]=(api_token,time.time()+1800)
-            session.clear();session['sid']=sid;session['csrf']=secrets.token_urlsafe(32)
+            response = requests.post(
+                PAPERLESS + '/api/token/',
+                json={
+                    'username': request.form['username'],
+                    'password': request.form['password']
+                },
+                timeout=15
+            )
+            response.raise_for_status()
+            api_token = response.json().get('token', '')
+
+            if not api_token:
+                raise ValueError('Kein Token')
+
+            sid = secrets.token_urlsafe(32)
+            with LOCK:
+                TOKENS[sid] = (api_token, time.time() + 1800)
+
+            session.clear()
+            session['sid'] = sid
+            session['csrf'] = secrets.token_urlsafe(32)
+            session.permanent = True
             return redirect(url_for('index'))
-        except (requests.RequestException,ValueError,KeyError):
-            error='Anmeldung fehlgeschlagen oder Paperless-Token-Endpunkt nicht verfügbar.'
-    return page('''<p>Mit bestehenden Paperless-Zugangsdaten anmelden.</p><p>{{error}}</p><form method="post"><label>Benutzername<input name="username" required></label><label>Passwort<input type="password" name="password" required></label><button>Anmelden</button></form>''',error=error)
+
+        except (requests.RequestException, ValueError, KeyError):
+            error = (
+                'Anmeldung fehlgeschlagen oder Paperless-Token-Endpunkt '
+                'nicht verfügbar.'
+            )
+
+    return page('''
+    <p>Mit bestehenden Paperless-Zugangsdaten anmelden.</p>
+    <p>{{error}}</p>
+    <form method="post">
+      <label>Benutzername
+        <input name="username" required>
+      </label>
+      <label>Passwort
+        <input name="password" type="password" required>
+      </label>
+      <button>Anmelden</button>
+    </form>
+    ''', error=error)
+
 
 @app.route('/logout')
 def logout():
-    sid=session.get('sid')
-    with LOCK:TOKENS.pop(sid,None)
-    session.clear();return redirect(url_for('login'))
+    sid = session.get('sid')
+    with LOCK:
+        TOKENS.pop(sid, None)
+    session.clear()
+    return redirect(url_for('login'))
+
 
 @app.route('/')
 @require_login
 def index():
-    rows=[]
-    for job in JOBS.glob('*/job.conf'):
-        info=read_job(job)
-        if info.get('STATUS')!='QUARANTINE':continue
-        did=info.get('PAPERLESS_DOCUMENT_ID','')
-        if not did.isdigit():continue
-        proposal=PROPOSALS/f'{did}.json'
-        if not proposal.is_file():continue
-        try: data=json.loads(proposal.read_text())
-        except (ValueError,OSError):continue
-        rows.append({'id':did,'category':data.get('proposal',{}).get('primary_tag',''),'reason':data.get('proposal',{}).get('reason','')})
-    return page('''<p>{{rows|length}} Dokumente zur Prüfung.</p>{% for r in rows %}<article><a href="{{url_for('review',did=r.id)}}">Dokument {{r.id}}</a> – {{r.category}}<p><small>{{r.reason}}</small></p></article>{% endfor %}''',rows=rows)
+    rows = []
 
-@app.route('/review/<int:did>',methods=['GET','POST'])
+    for job in JOBS.glob('*/job.conf'):
+        info = read_job(job)
+        if info.get('STATUS') != 'QUARANTINE':
+            continue
+
+        did = info.get('PAPERLESS_DOCUMENT_ID', '')
+        if not did.isdigit():
+            continue
+
+        proposal_path = PROPOSALS / f'{did}.json'
+        if not proposal_path.is_file():
+            continue
+
+        try:
+            data = json.loads(proposal_path.read_text(encoding='utf-8'))
+        except (ValueError, OSError):
+            continue
+
+        proposal = data.get('proposal', {})
+        rows.append({
+            'id': did,
+            'category': proposal.get('primary_tag', ''),
+            'reason': proposal.get('reason', '')
+        })
+
+    return page('''
+    <p>{{rows|length}} Dokumente zur Prüfung.</p>
+    {% for r in rows %}
+      <article>
+        <a href="{{url_for('review', did=r.id)}}">Dokument {{r.id}}</a>
+        – {{r.category}}
+        <p><small>{{r.reason}}</small></p>
+      </article>
+    {% endfor %}
+    ''', rows=rows)
+
+
+@app.route('/review/<int:did>', methods=['GET', 'POST'])
 @require_login
 def review(did):
-    path=PROPOSALS/f'{did}.json'
-    if not path.is_file():abort(404)
+    path = PROPOSALS / f'{did}.json'
+    if not path.is_file():
+        abort(404)
+
     with LOCK:
-        job=job_for_doc(did)
-        if not job:abort(404)
-        data=json.loads(path.read_text()); prop=data.get('proposal',{})
-        if request.method=='POST':
+        job = job_for_doc(did)
+        if not job:
+            abort(404)
+
+        data = json.loads(path.read_text(encoding='utf-8'))
+        prop = data.get('proposal', {})
+
+        if request.method == 'POST':
             csrf()
-            primary=request.form.get('primary','').strip()
-            if not primary or len(primary)>120:abort(400)
-            title=request.form.get('title','').strip()
-            if not title or len(title)>160:abort(400)
-            tags=[x.strip() for x in request.form.get('tags','').split(',') if x.strip()]
-            if len(tags)>30 or any(len(t)>120 for t in tags):abort(400)
-            corr=request.form.get('correspondent','').strip()
-            date_value=request.form.get('date','').strip()
-            if len(corr)>180:abort(400)
+
+            primary = request.form.get('primary', '').strip()
+            if not primary or len(primary) > 120:
+                abort(400)
+
+            title = request.form.get('title', '').strip()
+            if not title or len(title) > 160:
+                abort(400)
+
+            tags = [
+                value.strip()
+                for value in request.form.get('tags', '').split(',')
+                if value.strip()
+            ]
+            if len(tags) > 30 or any(len(value) > 120 for value in tags):
+                abort(400)
+
+            corr = request.form.get('correspondent', '').strip()
+            date_value = request.form.get('date', '').strip()
+
+            if len(corr) > 180:
+                abort(400)
+
             if date_value:
                 try:
-                    if date_type.fromisoformat(date_value).isoformat() != date_value: abort(400)
+                    if date_type.fromisoformat(date_value).isoformat() != date_value:
+                        abort(400)
                 except ValueError:
                     abort(400)
-            prop.update(title=title,primary_tag=primary,additional_tags=tags,correspondent_suggestion=corr or None,document_date=date_value,requires_review=False,review_decision='no_check_needed',validation_warnings=[])
+
+            prop.update(
+                title=title,
+                primary_tag=primary,
+                additional_tags=tags,
+                correspondent_suggestion=corr or None,
+                document_date=date_value,
+                requires_review=False,
+                review_decision='no_check_needed',
+                validation_warnings=[]
+            )
+
             shared_lock = archive_cron_lock()
             if shared_lock is None:
-                return page("""<p>Die Archivierung läuft gerade. Bitte in wenigen Sekunden erneut versuchen.</p><p><a href="{{url_for('review',did=did)}}">Zurück zur Prüfung</a></p>""", did=did), 409
+                return page('''
+                <p>Die Archivierung läuft gerade. Bitte in wenigen Sekunden
+                erneut versuchen.</p>
+                <p><a href="{{url_for('review', did=did)}}">Zurück</a></p>
+                ''', did=did), 409
+
             try:
-                # Jobstatus erneut unter dem gemeinsamen Lock prüfen.
                 current_job = read_job(job)
                 if current_job.get('STATUS') != 'QUARANTINE':
                     abort(409, 'Job ist nicht mehr in Quarantäne.')
-                data['proposal']=prop;data['applied']=False
-                data['manual_review']={'approved_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'approved_by':'paperless-authenticated'}
-                save_json(path,data)
-                original=job.read_text(); updated=re.sub(r'(?m)^STATUS=.*$', 'STATUS=REVIEW_APPROVED',original,count=1)
-                if updated==original:abort(500)
-                fd,tmp=tempfile.mkstemp(dir=job.parent,prefix='.review-job-')
+
+                data['proposal'] = prop
+                data['applied'] = False
+                data.pop('applied_at', None)
+                data['manual_review'] = {
+                    'approved_at': time.strftime(
+                        '%Y-%m-%dT%H:%M:%SZ', time.gmtime()
+                    ),
+                    'approved_by': 'paperless-authenticated'
+                }
+                save_json(path, data)
+
+                original = job.read_text()
+                updated = re.sub(
+                    r'(?m)^STATUS=.*$',
+                    'STATUS=REVIEW_APPROVED',
+                    original,
+                    count=1
+                )
+                if updated == original:
+                    abort(500)
+
+                fd, tmp = tempfile.mkstemp(
+                    dir=job.parent,
+                    prefix='.review-job-'
+                )
                 try:
-                    with os.fdopen(fd,'w') as f:f.write(updated);f.flush();os.fsync(f.fileno())
-                    os.replace(tmp,job)
+                    with os.fdopen(fd, 'w') as handle:
+                        handle.write(updated)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(tmp, job)
                 finally:
-                    if os.path.exists(tmp):os.unlink(tmp)
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+
             finally:
                 fcntl.flock(shared_lock.fileno(), fcntl.LOCK_UN)
                 shared_lock.close()
+
             return redirect(url_for('index'))
-    return page('''<article><h2>Dokument {{did}}</h2><p>{{prop.reason}}</p><p><a href="{{url_for('preview',did=did)}}" target="_blank">Dokumentvorschau öffnen</a></p>
-<section class="gemini-info" aria-label="Gemini-Bewertung">
-<h3>Gemini-Bewertung</h3>
-<dl>
-<dt>Confidence</dt><dd>{{ '%.2f'|format(prop.confidence) if prop.confidence is number else 'nicht vorhanden' }}</dd>
-<dt>requires_review</dt><dd>{{ prop.requires_review if prop.requires_review is defined else 'nicht vorhanden' }}</dd>
-<dt>review_decision</dt><dd>{{ prop.review_decision or 'nicht vorhanden' }}</dd>
-</dl>
-</section><form method="post"><input type="hidden" name="csrf" value="{{csrf}}"><label>Dokumenttitel<input name="title" type="text" maxlength="160" value="{{prop.title or data.get('existing', {}).get('title', '')}}" required></label><label>Hauptkategorie<input name="primary" value="{{prop.primary_tag or ''}}" required></label><label>Weitere Tags (kommagetrennt)<input name="tags" value="{{(prop.additional_tags or [])|join(', ')}}"></label><label>Korrespondent<input name="correspondent" value="{{prop.correspondent_suggestion or prop.correspondent or ''}}"></label><label>Dokumentdatum YYYY-MM-DD (optional)<input name="date" value="{{prop.document_date or ''}}"></label><button type="submit">Korrigieren und freigeben</button></form></article>''',did=did,prop=prop,data=data,csrf=session['csrf'])
+
+    return page('''
+    <article>
+      <h2>Dokument {{did}}</h2>
+      <p>{{prop.reason}}</p>
+      <p>
+        <a href="{{url_for('preview', did=did)}}" target="_blank"
+           rel="noopener">Dokumentvorschau öffnen</a>
+      </p>
+      <section class="gemini-info" aria-label="Gemini-Bewertung">
+        <h3>Gemini-Bewertung</h3>
+        <dl>
+          <dt>Confidence</dt>
+          <dd>{{'%.2f'|format(prop.confidence)
+                 if prop.confidence is number else 'nicht vorhanden'}}</dd>
+          <dt>requires_review</dt>
+          <dd>{{prop.requires_review
+                 if prop.requires_review is defined else 'nicht vorhanden'}}</dd>
+          <dt>review_decision</dt>
+          <dd>{{prop.review_decision or 'nicht vorhanden'}}</dd>
+        </dl>
+      </section>
+      <form method="post">
+        <input type="hidden" name="csrf" value="{{csrf}}">
+        <label>Dokumenttitel
+          <input name="title" type="text" maxlength="160"
+                 value="{{prop.title or data.get('existing', {}).get('title', '')}}"
+                 required>
+        </label>
+        <label>Hauptkategorie
+          <input name="primary" value="{{prop.primary_tag or ''}}" required>
+        </label>
+        <label>Weitere Tags (kommagetrennt)
+          <input name="tags" value="{{(prop.additional_tags or [])|join(', ')}}">
+        </label>
+        <label>Korrespondent
+          <input name="correspondent"
+                 value="{{prop.correspondent_suggestion or prop.correspondent or ''}}">
+        </label>
+        <label>Dokumentdatum YYYY-MM-DD (optional)
+          <input name="date" value="{{prop.document_date or ''}}">
+        </label>
+        <button type="submit">Korrigieren und freigeben</button>
+      </form>
+    </article>
+    ''', did=did, prop=prop, data=data, csrf=session['csrf'])
+
+
+@app.route('/reapply', methods=['GET', 'POST'])
+@require_login
+def reapply():
+    did = ''
+    error = ''
+    result = ''
+    output = ''
+    data = None
+    current_doc = None
+    action = 'lookup'
+
+    if request.method == 'POST':
+        csrf()
+        did = request.form.get('document_id', '').strip()
+        action = request.form.get('action', 'lookup')
+
+        if not did.isdigit() or int(did) <= 0:
+            error = 'Bitte eine gültige Paperless-Dokumenten-ID eingeben.'
+        else:
+            try:
+                path, data = load_proposal(did)
+
+                # Zusätzlich prüfen, ob das Dokument in Paperless existiert.
+                current_doc = paperless_document(did)
+
+            except FileNotFoundError as exc:
+                error = str(exc)
+            except (ValueError, OSError, requests.RequestException) as exc:
+                error = f'Dokument oder Proposal konnte nicht geladen werden: {exc}'
+
+        if not error and action == 'apply':
+            prop = data['proposal']
+            confidence = prop.get('confidence')
+            warnings = prop.get('validation_warnings') or []
+
+            if not APPLY_SCRIPT.is_file():
+                error = f'Apply-Skript nicht gefunden: {APPLY_SCRIPT}'
+            elif not os.access(APPLY_SCRIPT, os.X_OK):
+                error = 'Das Apply-Skript ist nicht ausführbar.'
+            elif (
+                not isinstance(confidence, (int, float))
+                or isinstance(confidence, bool)
+                or confidence < 0.85
+            ):
+                error = 'Confidence liegt unter 0,85 oder ist ungültig.'
+            elif warnings:
+                error = (
+                    'Das Proposal enthält Validierungswarnungen. '
+                    'Bitte zuerst manuell prüfen.'
+                )
+            elif (
+                not isinstance(prop.get('primary_tag'), str)
+                or not prop['primary_tag'].strip()
+            ):
+                error = 'Die Hauptkategorie fehlt.'
+            else:
+                shared_lock = archive_cron_lock()
+
+                if shared_lock is None:
+                    error = (
+                        'Die Archivierung läuft gerade. '
+                        'Bitte später erneut versuchen.'
+                    )
+                else:
+                    backup_path = None
+
+                    try:
+                        # Unter der Sperre erneut lesen und validieren.
+                        path, current = load_proposal(did)
+                        current_prop = current['proposal']
+                        current_confidence = current_prop.get('confidence')
+                        current_warnings = (
+                            current_prop.get('validation_warnings') or []
+                        )
+
+                        if (
+                            not isinstance(current_confidence, (int, float))
+                            or isinstance(current_confidence, bool)
+                            or current_confidence < 0.85
+                            or current_warnings
+                            or not current_prop.get('primary_tag')
+                        ):
+                            raise ValueError(
+                                'Die Freigabebedingungen sind nicht mehr erfüllt.'
+                            )
+
+                        # Sicherung vor jeder Änderung; vorhandene Backups bleiben erhalten.
+                        BACKUPS.mkdir(parents=True, exist_ok=True)
+                        timestamp = time.strftime('%Y%m%d_%H%M%S', time.gmtime())
+                        backup_path = BACKUPS / (
+                            f'{did}.json.reapply.{timestamp}.bak'
+                        )
+
+                        with backup_path.open('xb') as backup:
+                            backup.write(path.read_bytes())
+                            backup.flush()
+                            os.fsync(backup.fileno())
+
+                        # Ausdrückliche erneute Freigabe für das Apply-Skript.
+                        current_prop['requires_review'] = False
+                        current_prop['review_decision'] = 'no_check_needed'
+                        current['proposal'] = current_prop
+                        current['applied'] = False
+                        current.pop('applied_at', None)
+                        current['manual_review'] = {
+                            'approved_at': time.strftime(
+                                '%Y-%m-%dT%H:%M:%SZ', time.gmtime()
+                            ),
+                            'approved_by': 'paperless-authenticated-reapply'
+                        }
+                        save_json(path, current)
+
+                        # Token nur an den Kindprozess übergeben, nicht an den Browser.
+                        env = os.environ.copy()
+                        env['PAPERLESS_TOKEN'] = token()
+                        env['PAPERLESS_URL'] = PAPERLESS
+
+                        try:
+                            proc = subprocess.run(
+                                [str(APPLY_SCRIPT), '--id', did, '--apply'],
+                                env=env,
+                                capture_output=True,
+                                text=True,
+                                timeout=300,
+                                check=False
+                            )
+                            output = (
+                                (proc.stdout or '') + '\n' + (proc.stderr or '')
+                            ).strip()
+                        except subprocess.TimeoutExpired as exc:
+                            output = (
+                                str(exc.stdout or '') + '\n'
+                                + str(exc.stderr or '')
+                            ).strip()
+                            error = (
+                                'Zeitüberschreitung beim Apply-Prozess. '
+                                'Bitte Paperless und das Proposal prüfen, '
+                                'bevor du es erneut versuchst.'
+                            )
+                            proc = None
+
+                        if proc is not None:
+                            try:
+                                after = json.loads(
+                                    path.read_text(encoding='utf-8')
+                                )
+                            except (ValueError, OSError):
+                                after = {}
+
+                            if proc.returncode == 0 and after.get('applied') is True:
+                                result = (
+                                    f'Dokument {did} wurde laut Apply-Skript '
+                                    'erfolgreich angewendet.'
+                                )
+                            else:
+                                error = (
+                                    f'Dokument {did} wurde nicht nachweislich '
+                                    'erfolgreich angewendet. Bitte die Ausgabe '
+                                    'prüfen. Es wurde kein automatischer '
+                                    'Rollback durchgeführt.'
+                                )
+
+                    except (OSError, ValueError, json.JSONDecodeError) as exc:
+                        error = f'Abbruch: {exc}'
+                    finally:
+                        fcntl.flock(shared_lock.fileno(), fcntl.LOCK_UN)
+                        shared_lock.close()
+
+                    # Nach der Anwendung erneut die Proposal-Daten laden.
+                    try:
+                        path, data = load_proposal(did)
+                    except (OSError, ValueError, FileNotFoundError):
+                        data = None
+
+    if data is None and not error:
+        return page('''
+        <article>
+          <h2>Dokument erneut anwenden</h2>
+          <p>Gib die Paperless-Dokumenten-ID ein.</p>
+          <form method="post">
+            <input type="hidden" name="csrf" value="{{csrf}}">
+            <label>Paperless-Dokumenten-ID
+              <input name="document_id" inputmode="numeric"
+                     pattern="[0-9]+" required>
+            </label>
+            <button name="action" value="lookup">Proposal anzeigen</button>
+          </form>
+        </article>
+        ''', csrf=session['csrf'])
+
+    if data is not None:
+        prop = data.get('proposal', {})
+        doc_title = (current_doc or {}).get('title', '')
+        current_created = (current_doc or {}).get('created', '')
+        current_corr = (current_doc or {}).get('correspondent')
+        current_tags = (current_doc or {}).get('tags', [])
+
+        return page('''
+        <article>
+          <h2>Dokument {{did}} – erneut anwenden</h2>
+
+          {% if error %}
+            <p class="status-error">{{error}}</p>
+          {% endif %}
+          {% if result %}
+            <p class="status-ok">{{result}}</p>
+          {% endif %}
+
+          <section class="gemini-info">
+            <h3>Gespeichertes Proposal</h3>
+            <dl>
+              <dt>Dokumenttitel (Paperless)</dt><dd>{{doc_title or '–'}}</dd>
+              <dt>Vorgeschlagener Titel</dt><dd>{{prop.title or '–'}}</dd>
+              <dt>Hauptkategorie</dt><dd>{{prop.primary_tag or '–'}}</dd>
+              <dt>Weitere Tags</dt><dd>{{(prop.additional_tags or [])|join(', ') or '–'}}</dd>
+              <dt>Vorgeschlagener Korrespondent</dt>
+              <dd>{{prop.correspondent or prop.correspondent_suggestion or '–'}}</dd>
+              <dt>Paperless-Korrespondent-ID</dt><dd>{{current_corr if current_corr is not none else '–'}}</dd>
+              <dt>Vorgeschlagenes Datum</dt><dd>{{prop.document_date or '–'}}</dd>
+              <dt>Aktuelles Paperless-Datum</dt><dd>{{current_created or '–'}}</dd>
+              <dt>Confidence</dt><dd>{{prop.confidence if prop.confidence is defined else '–'}}</dd>
+              <dt>Prüfentscheidung</dt><dd>{{prop.review_decision or '–'}}</dd>
+              <dt>Bereits angewendet</dt><dd>{{data.applied}}</dd>
+              <dt>Paperless-Tags (IDs)</dt><dd>{{current_tags}}</dd>
+              <dt>Validierungswarnungen</dt>
+              <dd>{{(prop.validation_warnings or [])|join('; ') or 'Keine'}}</dd>
+            </dl>
+          </section>
+
+          <p>
+            <strong>Achtung:</strong> Die gespeicherten Metadaten werden erneut
+            auf Paperless angewendet. Bestehende Tags bleiben erhalten.
+            Ein vorgeschlagenes Datum kann das Paperless-Datum ändern.
+            Der Titel und ein bereits gesetzter Korrespondent werden nur nach
+            den Regeln des Apply-Skripts geändert.
+          </p>
+
+          {% if not result %}
+          <form method="post"
+                onsubmit="return confirm('Vorschlag für Dokument {{did}} wirklich erneut nach Paperless schreiben?');">
+            <input type="hidden" name="csrf" value="{{csrf}}">
+            <input type="hidden" name="document_id" value="{{did}}">
+            <button name="action" value="apply">
+              Erneut anwenden und nach Paperless schreiben
+            </button>
+          </form>
+          {% endif %}
+
+          {% if output %}
+            <h3>Ausgabe des Apply-Skripts</h3>
+            <pre>{{output}}</pre>
+          {% endif %}
+        </article>
+        <article>
+          <form method="post">
+            <input type="hidden" name="csrf" value="{{csrf}}">
+            <label>Andere Dokumenten-ID
+              <input name="document_id" inputmode="numeric"
+                     pattern="[0-9]+" required>
+            </label>
+            <button name="action" value="lookup">Anderes Proposal anzeigen</button>
+          </form>
+        </article>
+        ''',
+        did=did,
+        prop=prop,
+        data=data,
+        doc_title=doc_title,
+        current_created=current_created,
+        current_corr=current_corr,
+        current_tags=current_tags,
+        error=error,
+        result=result,
+        output=output,
+        csrf=session['csrf'])
+
+    return page('''
+    <article>
+      <h2>Dokument erneut anwenden</h2>
+      <p class="status-error">{{error}}</p>
+      {% if output %}<h3>Ausgabe</h3><pre>{{output}}</pre>{% endif %}
+      <form method="post">
+        <input type="hidden" name="csrf" value="{{csrf}}">
+        <label>Paperless-Dokumenten-ID
+          <input name="document_id" value="{{did}}"
+                 inputmode="numeric" pattern="[0-9]+" required>
+        </label>
+        <button name="action" value="lookup">Erneut prüfen</button>
+      </form>
+    </article>
+    ''', did=did, error=error, output=output, csrf=session['csrf'])
+
 
 @app.route('/preview/<int:did>')
 @require_login
 def preview(did):
-    if not job_for_doc(did):abort(404)
-    response=requests.get(f'{PAPERLESS}/api/documents/{did}/preview/',headers={'Authorization':'Token '+token()},timeout=45)
-    if response.status_code!=200:abort(502)
-    return Response(response.content,content_type=response.headers.get('Content-Type','application/pdf'),headers={'X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; sandbox"})
+    if not job_for_doc(did):
+        abort(404)
 
-if __name__=='__main__':
+    response = requests.get(
+        f'{PAPERLESS}/api/documents/{did}/preview/',
+        headers={'Authorization': 'Token ' + token()},
+        timeout=45
+    )
+
+    if response.status_code != 200:
+        abort(502)
+
+    return Response(
+        response.content,
+        content_type=response.headers.get('Content-Type', 'application/pdf'),
+        headers={
+            'X-Content-Type-Options': 'nosniff',
+            'Content-Security-Policy': "default-src 'none'; sandbox"
+        }
+    )
+
+
+if __name__ == '__main__':
     from waitress import serve
-    serve(app,host=os.environ.get('QUARANTINE_BIND','0.0.0.0'),port=int(os.environ.get('QUARANTINE_PORT','1889')),threads=4)
+
+    serve(
+        app,
+        host=os.environ.get('QUARANTINE_BIND', '0.0.0.0'),
+        port=int(os.environ.get('QUARANTINE_PORT', '1889')),
+        threads=4
+    )
