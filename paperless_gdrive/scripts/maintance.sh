@@ -1,4 +1,4 @@
-#!/bin/bash
+!/bin/bash
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -827,6 +827,89 @@ cleanup() {
 }
 
 # ============================================================
+# Gemini-Fehlerjobs zurücksetzen
+# ============================================================
+
+reset_gemini_jobs() {
+    echo
+    echo "============================================================"
+    echo " Reset Gemini"
+    echo "============================================================"
+    echo "Es werden ausschließlich Jobs mit STATUS=GEMINI_FAILED berücksichtigt."
+    echo "Diese werden auf GEMINI_PENDING gesetzt und GEMINI_ATTEMPTS wird auf 0 gesetzt."
+    echo "ERROR_TYPE und ERROR_MESSAGE bleiben als Fehlerhistorie erhalten."
+    echo
+
+    local job_file job_id status source_name attempts
+    local count=0
+    local changed=0
+    local answer
+
+    # Zuerst nur anzeigen und zählen; bis zur Bestätigung keine Änderungen.
+    for job_file in "${JOB_DIR}"/*/job.conf; do
+        [[ -f "${job_file}" ]] || continue
+        status="$(get_job_value "${job_file}" "STATUS")"
+        [[ "${status}" == "GEMINI_FAILED" ]] || continue
+
+        job_id="$(basename "$(dirname "${job_file}")")"
+        source_name="$(get_job_value "${job_file}" "SOURCE_NAME")"
+        attempts="$(get_job_value "${job_file}" "GEMINI_ATTEMPTS")"
+        printf '  %-36s Versuche: %-5s %s\n' \
+            "${job_id}" "${attempts:-0}" "${source_name}"
+        count=$((count + 1))
+    done
+
+    if (( count == 0 )); then
+        echo "Keine Jobs mit STATUS=GEMINI_FAILED gefunden."
+        echo
+        return 0
+    fi
+
+    echo
+    echo "Gefundene Jobs: ${count}"
+    echo "Die erneute Verarbeitung erfolgt anschließend über Script 03."
+    echo
+    read -r -p "Alle aufgeführten Gemini-Fehlerjobs zurücksetzen? [j/N] " answer
+
+    case "${answer}" in
+        j|J|ja|JA|Ja) ;;
+        *)
+            echo "Abgebrochen. Keine Änderungen."
+            return 0
+            ;;
+    esac
+
+    for job_file in "${JOB_DIR}"/*/job.conf; do
+        [[ -f "${job_file}" ]] || continue
+
+        # Status erneut prüfen, damit nur weiterhin fehlgeschlagene Jobs geändert werden.
+        status="$(get_job_value "${job_file}" "STATUS")"
+        [[ "${status}" == "GEMINI_FAILED" ]] || continue
+
+        job_id="$(basename "$(dirname "${job_file}")")"
+
+        # Erst Zähler zurücksetzen, dann den Job wieder freigeben.
+        if ! job_update "${job_id}" "GEMINI_ATTEMPTS" "0"; then
+            echo "[FEHLER] ${job_id}: GEMINI_ATTEMPTS konnte nicht zurückgesetzt werden."
+            continue
+        fi
+
+        if ! job_set_status "${job_id}" "GEMINI_PENDING"; then
+            echo "[FEHLER] ${job_id}: Status konnte nicht auf GEMINI_PENDING gesetzt werden."
+            continue
+        fi
+
+        echo "[OK] ${job_id}: GEMINI_FAILED -> GEMINI_PENDING (Versuche=0)"
+        changed=$((changed + 1))
+    done
+
+    echo
+    echo "Zurückgesetzte Jobs: ${changed} von ${count}"
+    echo "Fehlerdetails wurden zur Diagnose beibehalten."
+    echo
+}
+
+# ============================================================
 # Proposals verwalten
 # ============================================================
 
@@ -1138,10 +1221,11 @@ while true; do
     echo "  4) Aufräumen"
     echo "  5) Wiederanlauf"
     echo "  6) Proposals"
+    echo "  7) Reset Gemini (GEMINI_FAILED zurücksetzen)"
     echo "  x) Exit"
     echo
 
-    read -r -p "Auswahl [1-6/x]: " choice
+    read -r -p "Auswahl [1-7/x]: " choice
 
     case "${choice}" in
         1)
@@ -1163,6 +1247,10 @@ while true; do
             ;;
         6)
             proposals_menu
+            ;;
+        7)
+            reset_gemini_jobs
+            read -r -p "Weiter mit Enter..."
             ;;
         x|X)
             echo "Exit."
