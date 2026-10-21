@@ -33,6 +33,7 @@ services:
       PAPERLESS_CONSUMER_DELETE_DUPLICATES: "true"
       # E-Mail-Abruf deaktivieren
       PAPERLESS_EMAIL_TASK_CRON: disable
+      PAPERLESS_OPTIMIZE_THUMBNAILS: false
 
       # -------------------------------------------------
       # PostgreSQL

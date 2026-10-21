@@ -76,7 +76,11 @@ paperless_has_active_job() {
             ' "${job_file}"
         )"
 
-        [[ -n "${task_id}" ]] || continue
+        # Nur gültige Task-UUIDs an die Paperless-API übergeben.
+        # Leere oder fehlerhaft gespeicherte IDs überspringen.
+        if [[ ! "${task_id}" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+            continue
+        fi
 
         task_status="$(
             paperless_task_status "${task_id}" 2>/dev/null || true
