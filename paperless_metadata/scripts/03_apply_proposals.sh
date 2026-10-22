@@ -283,7 +283,8 @@ for file in "${files[@]}"; do
         + (if $date != "" then {created:$date} else {} end)
         + (if $corr != "" and ($olddoc[0].correspondent == null or $manual_approved != "")
            then {correspondent:($corr|tonumber)} else {} end)
-        + (if $title != "" and $manual_approved != "" then {title:$title} else {} end)
+	+ (if $title != "" then {title:$title} else {} end)
+#        + (if $title != "" and $manual_approved != "" then {title:$title} else {} end)
       ')"; then
       rm -f "$doc_tmp"
       echo "[FEHLER] Dokument $id: PATCH konnte nicht erstellt werden." >&2
@@ -317,8 +318,10 @@ for file in "${files[@]}"; do
       continue
     fi
 
-    if [[ -n "$manual_approved" && -n "$title" ]] &&
+    if [[ -n "$title" ]] &&
        [[ "$(jq -r '.title // empty' <<< "$verified")" != "$title" ]]; then
+#    if [[ -n "$manual_approved" && -n "$title" ]] &&
+#       [[ "$(jq -r '.title // empty' <<< "$verified")" != "$title" ]]; then
       echo "[FEHLER] Dokument $id: Titel nicht bestätigt" >&2
       ((count_failed+=1))
       continue
