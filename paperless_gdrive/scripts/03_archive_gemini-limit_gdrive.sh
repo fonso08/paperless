@@ -70,6 +70,41 @@ metadata_safe_name() {
     printf '%s' "$v" | sed -E 's/_+/_/g; s/^[_. -]+//; s/[_. -]+$//'
 }
 
+# Exakter Segmenttest: noLLM gilt nur fuer einen eigenen Pfadbestandteil.
+nollm_source_path() {
+    local path="${1:-}"
+    case "/${path#/}/" in
+        */noLLM/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# noLLM-Dokumente bekommen das Paperless-Tag, laufen aber nicht durch Gemini.
+nollm_tag_document() {
+    local did="$1" tags tag_id doc_json current_tags merged payload response
+    tags="$(paperless_curl "$(paperless_api_url 'tags/?page_size=1000')")" || return 1
+    tag_id="$(jq -r '[.results[]? | select(.name == "noLLM")][0].id // empty' <<< "$tags")"
+    if [[ -z "$tag_id" ]]; then
+        response="$(curl -fsS --connect-timeout 10 --max-time 30 \
+            -H "Authorization: Token ${PAPERLESS_TOKEN}" \
+            -H 'Accept: application/json' -H 'Content-Type: application/json' \
+            -X POST "$(paperless_api_url 'tags/')" \
+            --data '{"name":"noLLM"}')" || return 1
+        tag_id="$(jq -r '.id // empty' <<< "$response")"
+    fi
+    [[ "$tag_id" =~ ^[0-9]+$ ]] || { error 'Paperless-Tag noLLM konnte nicht ermittelt/angelegt werden.'; return 1; }
+    doc_json="$(paperless_document_json "$did")" || return 1
+    current_tags="$(jq -c '.tags // []' <<< "$doc_json")" || return 1
+    merged="$(jq -cn --argjson old "$current_tags" --argjson add "$tag_id" '($old + [$add] | unique)')" || return 1
+    payload="$(jq -cn --argjson tags "$merged" '{tags:$tags}')" || return 1
+    curl -fsS --connect-timeout 10 --max-time 30 \
+        -H "Authorization: Token ${PAPERLESS_TOKEN}" \
+        -H 'Accept: application/json' -H 'Content-Type: application/json' \
+        -X PATCH "$(paperless_api_url "documents/${did}/")" \
+        --data "$payload" >/dev/null || return 1
+    info "Paperless-Tag noLLM fuer Dokument ${did} gesetzt."
+}
+
 metadata_process_job() {
     local jid="$1" did="$2"
     local proposal="$METADATA_STATE/proposals/${did}.json"
@@ -693,7 +728,7 @@ while IFS= read -r job_file; do
     status="${STATUS:-}"
 
     case "${status}" in
-        PAPERLESS_SUBMITTED|PAPERLESS_PROCESSING|GEMINI_PENDING|GEMINI_FAILED|REVIEW_APPROVED|QUARANTINE|PAPERLESS_DONE|ARCHIVE_PROCESSING|ARCHIVE_FAILED|DUPLICATE)
+        PAPERLESS_SUBMITTED|PAPERLESS_PROCESSING|GEMINI_PENDING|GEMINI_FAILED|GEMINI_SKIPPED|REVIEW_APPROVED|QUARANTINE|PAPERLESS_DONE|ARCHIVE_PROCESSING|ARCHIVE_FAILED|DUPLICATE)
             ;;
         *)
             continue
@@ -721,6 +756,12 @@ while IFS= read -r job_file; do
         continue
     fi
 
+
+    # noLLM wartet auf explizite Freigabe in der Quarantaene-Weboberflaeche.
+    # Es darf niemals in den Gemini-Verarbeitungspfad fallen.
+    if [[ "$status" == "GEMINI_SKIPPED" ]]; then
+        continue
+    fi
 
     # Quarantaene bleibt bis zur manuellen Freigabe unveraendert.
     if [[ "$status" == "QUARANTINE" ]]; then
@@ -867,9 +908,11 @@ while IFS= read -r job_file; do
         archive_target="${ARCHIVE_TARGET:-}"
 
         if [[ -z "${archive_target}" ]]; then
-            archive_target="$(
-                archive_target_from_category "${category}"
-            )"
+            if [[ "${NOLLM_APPROVED:-false}" == "true" && -n "${CORRESPONDENT:-}" ]]; then
+                archive_target="${GDRIVE_ARCHIVE%/}/${category}/${CORRESPONDENT}"
+            else
+                archive_target="$(archive_target_from_category "${category}")"
+            fi
 
             job_update \
                 "${job_id}" \
@@ -1118,9 +1161,24 @@ while IFS= read -r job_file; do
                 "success"
 
 
-            # Keine Archivierung vor erfolgreicher Gemini-Metadatenuebernahme.
-            job_set_status "${job_id}" "GEMINI_PENDING"
-            info "Job ${job_id} wartet auf Gemini-Klassifizierung."
+            # noLLM: Tag setzen, Gemini ueberspringen und explizite Freigabe verlangen.
+            # Der exakte Pfadbestandteil ist entscheidend; noLLM_alt etc. bleiben normal.
+            if nollm_source_path "${SOURCE_PATH:-}"; then
+                if ! nollm_tag_document "${document_id}"; then
+                    job_update "${job_id}" ERROR_TYPE NOLLM_TAG_FAILED
+                    job_update "${job_id}" NOLLM_TAG_PENDING true
+                    job_set_status "${job_id}" GEMINI_SKIPPED
+                    error "Job ${job_id}: noLLM-Tag konnte nicht gesetzt werden; bleibt ohne Archivfreigabe in der noLLM-Prüfung."
+                else
+                    job_update "${job_id}" NOLLM_APPROVED false
+                    job_set_status "${job_id}" GEMINI_SKIPPED
+                    info "Job ${job_id} ist noLLM: Gemini uebersprungen; wartet auf manuelle Freigabe."
+                fi
+            else
+                # Bestehender Gemini-Pfad bleibt unveraendert.
+                job_set_status "${job_id}" "GEMINI_PENDING"
+                info "Job ${job_id} wartet auf Gemini-Klassifizierung."
+            fi
 
             processed=$((processed + 1))
             ;;

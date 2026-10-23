@@ -12,6 +12,7 @@ import tempfile
 import threading
 import fcntl
 import subprocess
+import shlex
 from datetime import date as date_type
 from pathlib import Path
 from functools import wraps
@@ -79,7 +80,7 @@ article{background:#fff;border:1px solid var(--line);border-radius:8px;padding:2
 .gemini-info dd{margin:0;font-weight:600;overflow-wrap:anywhere}
 label{display:block;font-weight:600;margin-top:14px}
 input,textarea,button{font:inherit;max-width:100%;border-radius:5px}
-input,textarea{display:block;width:100%;padding:10px 11px;margin-top:5px;border:1px solid #b8c5d1;background:#fff;color:var(--ink)}
+input,textarea,select{display:block;width:100%;padding:10px 11px;margin-top:5px;border:1px solid #b8c5d1;background:#fff;color:var(--ink)}
 input:focus,textarea:focus{outline:2px solid #93c5fd;border-color:var(--blue)}
 button,.button{display:inline-block;border:0;background:var(--blue);color:#fff;padding:10px 16px;margin-top:18px;font-weight:600;text-decoration:none;cursor:pointer}
 button:hover,.button:hover{background:#12558b}
@@ -143,12 +144,21 @@ def csrf():
 
 def read_job(path):
     data = {}
-    for line in path.read_text().splitlines():
+    wanted = {
+        'STATUS', 'PAPERLESS_DOCUMENT_ID', 'JOB_ID', 'SOURCE_PATH',
+        'SOURCE_NAME', 'CATEGORY', 'CORRESPONDENT', 'NOLLM_APPROVED'
+    }
+    for line in path.read_text(encoding='utf-8').splitlines():
         if '=' in line:
             key, value = line.split('=', 1)
-            if key in ('STATUS', 'PAPERLESS_DOCUMENT_ID', 'JOB_ID'):
+            if key in wanted:
                 data[key] = value.strip().strip("'\"")
     return data
+
+
+def is_nollm_source(path_value):
+    # SOURCE_PATH is relative to gdrive:SCAN. Match a complete path segment only.
+    return 'noLLM' in Path(path_value.replace('\\', '/')).parts
 
 
 def job_for_doc(doc_id):
@@ -160,6 +170,88 @@ def job_for_doc(doc_id):
         ):
             return path
     return None
+
+
+def job_for_nollm_doc(doc_id):
+    for path in JOBS.glob('*/job.conf'):
+        data = read_job(path)
+        if (data.get('PAPERLESS_DOCUMENT_ID') == str(doc_id)
+                and data.get('STATUS') == 'GEMINI_SKIPPED'
+                and is_nollm_source(data.get('SOURCE_PATH', ''))):
+            return path
+    return None
+
+
+def update_job_fields(path, fields):
+    """Atomically update selected shell assignments without dropping other job data."""
+    lines = path.read_text(encoding='utf-8').splitlines()
+    replacements = {key: f'{key}={shlex.quote(str(value))}' for key, value in fields.items()}
+    seen = set()
+    updated = []
+    for line in lines:
+        key = line.split('=', 1)[0] if '=' in line else ''
+        if key in replacements:
+            if key not in seen:
+                updated.append(replacements[key])
+                seen.add(key)
+        else:
+            updated.append(line)
+    for key, value in replacements.items():
+        if key not in seen:
+            updated.append(value)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix='.nollm-job-')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write('\n'.join(updated) + '\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def paperless_headers():
+    return {'Authorization': 'Token ' + token(), 'Accept': 'application/json'}
+
+
+def paperless_collection(endpoint):
+    items = []
+    url = f'{PAPERLESS}/api/{endpoint.lstrip("/")}'
+    while url:
+        response = requests.get(url, headers=paperless_headers(), timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        items.extend(payload.get('results', []))
+        next_url = payload.get('next')
+        if next_url and next_url.startswith('/'):
+            next_url = PAPERLESS + next_url
+        if next_url and not next_url.startswith(PAPERLESS + '/'):
+            raise ValueError('Paperless lieferte einen unerwarteten Folgelink.')
+        url = next_url
+    return items
+
+
+def ensure_nollm_tag(tags):
+    for item in tags:
+        if item.get('name', '').casefold() == 'nollm'.casefold():
+            return item
+    response = requests.post(
+        f'{PAPERLESS}/api/tags/', headers={**paperless_headers(),
+        'Content-Type': 'application/json'}, json={'name': 'noLLM'}, timeout=30
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def safe_archive_component(value):
+    value = re.sub(r'[\r\n/\\:*?"<>|]', '-', value.strip())
+    value = re.sub(r'\s+', '_', value)
+    value = re.sub(r'_+', '_', value).strip('_. -')
+    if not value or value in {'.', '..'}:
+        raise ValueError('Kategorie/Korrespondent ergibt keinen gültigen Archivpfad.')
+    return value
 
 
 def save_json(path, data):
@@ -290,42 +382,209 @@ def logout():
 @require_login
 def index():
     rows = []
+    nollm_rows = []
 
     for job in JOBS.glob('*/job.conf'):
         info = read_job(job)
-        if info.get('STATUS') != 'QUARANTINE':
-            continue
-
         did = info.get('PAPERLESS_DOCUMENT_ID', '')
         if not did.isdigit():
             continue
-
+        if info.get('STATUS') == 'GEMINI_SKIPPED' and is_nollm_source(info.get('SOURCE_PATH', '')):
+            nollm_rows.append({'id': did, 'source': info.get('SOURCE_PATH', '')})
+            continue
+        if info.get('STATUS') != 'QUARANTINE':
+            continue
         proposal_path = PROPOSALS / f'{did}.json'
         if not proposal_path.is_file():
             continue
-
         try:
             data = json.loads(proposal_path.read_text(encoding='utf-8'))
         except (ValueError, OSError):
             continue
-
         proposal = data.get('proposal', {})
-        rows.append({
-            'id': did,
-            'category': proposal.get('primary_tag', ''),
-            'reason': proposal.get('reason', '')
-        })
+        rows.append({'id': did, 'category': proposal.get('primary_tag', ''),
+                     'reason': proposal.get('reason', '')})
 
     return page('''
-    <p>{{rows|length}} Dokumente zur Prüfung.</p>
+    <h2>Dokumente zur Prüfung</h2>
+    <p>{{rows|length}} Gemini-Dokumente und {{nollm_rows|length}} noLLM-Dokumente warten auf Prüfung.</p>
+    {% for r in nollm_rows %}
+      <article>
+        <strong>noLLM – Dokument {{r.id}}</strong>
+        <p><small>{{r.source}}</small></p>
+        <a class="button" href="{{url_for('review_nollm', did=r.id)}}">Metadaten auswählen und freigeben</a>
+      </article>
+    {% endfor %}
     {% for r in rows %}
       <article>
-        <a href="{{url_for('review', did=r.id)}}">Dokument {{r.id}}</a>
-        – {{r.category}}
+        <a href="{{url_for('review', did=r.id)}}">Dokument {{r.id}}</a> – {{r.category}}
         <p><small>{{r.reason}}</small></p>
       </article>
     {% endfor %}
-    ''', rows=rows)
+    ''', rows=rows, nollm_rows=nollm_rows)
+
+
+@app.route('/review_nollm/<int:did>', methods=['GET', 'POST'])
+@require_login
+def review_nollm(did):
+    job = job_for_nollm_doc(did)
+    if not job:
+        abort(404)
+    error = ''
+    result = ''
+    try:
+        doc = paperless_document(did)
+        tags = paperless_collection('tags/?page_size=1000')
+        correspondents = paperless_collection('correspondents/?page_size=1000')
+        tags = sorted(tags, key=lambda item: item.get('name', '').casefold())
+        correspondents = sorted(correspondents, key=lambda item: item.get('name', '').casefold())
+    except (requests.RequestException, ValueError) as exc:
+        return page('<p class="status-error">Paperless-Daten konnten nicht geladen werden: {{error}}</p>', error=str(exc)), 502
+
+    if request.method == 'POST':
+        csrf()
+        shared_lock = archive_cron_lock()
+        if shared_lock is None:
+            return page("""<p class=\"status-error\">Die Archivierung läuft gerade. Bitte erneut versuchen.</p><p><a href=\"{{url_for('review_nollm', did=did)}}\">Zurück</a></p>""", did=did), 409
+        try:
+            current = read_job(job)
+            if current.get('STATUS') != 'GEMINI_SKIPPED' or not is_nollm_source(current.get('SOURCE_PATH', '')):
+                abort(409, 'Der Job ist kein freizugebender noLLM-Job mehr.')
+
+            title = request.form.get('title', '').strip()
+            category_id = request.form.get('category', '').strip()
+            correspondent_id = request.form.get('correspondent', '').strip()
+            new_correspondent = request.form.get('new_correspondent', '').strip()
+            selected_tag_ids = request.form.getlist('tags')
+            date_value = request.form.get('date', '').strip()
+            approve_date = request.form.get('approve_date') == 'yes'
+
+            tag_by_id = {str(item.get('id')): item for item in tags}
+            corr_by_id = {str(item.get('id')): item for item in correspondents}
+            if not title or len(title) > 250:
+                raise ValueError('Bitte einen Dokumenttitel mit maximal 250 Zeichen angeben.')
+            if category_id not in tag_by_id:
+                raise ValueError('Bitte eine vorhandene Hauptkategorie auswählen.')
+            if any(value not in tag_by_id for value in selected_tag_ids):
+                raise ValueError('Mindestens ein ausgewählter Tag ist ungültig.')
+            if approve_date:
+                if not date_value:
+                    raise ValueError('Für die Datumsübernahme muss ein Datum angegeben werden.')
+                try:
+                    if date_type.fromisoformat(date_value).isoformat() != date_value:
+                        raise ValueError
+                except ValueError:
+                    raise ValueError('Das Datum muss ein gültiges Datum im Format YYYY-MM-DD sein.')
+            else:
+                date_value = ''
+            if len(new_correspondent) > 180:
+                raise ValueError('Der Korrespondent darf höchstens 180 Zeichen lang sein.')
+            category_name = safe_archive_component(tag_by_id[category_id]['name'])
+            if new_correspondent:
+                safe_archive_component(new_correspondent)
+
+            if new_correspondent:
+                # Exact/case-insensitive match before creation, preventing duplicates on retry.
+                existing = next((c for c in correspondents
+                                 if c.get('name', '').casefold() == new_correspondent.casefold()), None)
+                if existing:
+                    corr_id = int(existing['id'])
+                    corr_name = existing['name']
+                else:
+                    response = requests.post(
+                        f'{PAPERLESS}/api/correspondents/',
+                        headers={**paperless_headers(), 'Content-Type': 'application/json'},
+                        json={'name': new_correspondent}, timeout=30
+                    )
+                    response.raise_for_status()
+                    created = response.json()
+                    corr_id = int(created['id'])
+                    corr_name = created['name']
+            else:
+                if correspondent_id not in corr_by_id:
+                    raise ValueError('Bitte einen vorhandenen Korrespondenten auswählen oder einen neuen Namen eingeben.')
+                corr_id = int(correspondent_id)
+                corr_name = corr_by_id[correspondent_id]['name']
+
+            no_llm_tag = ensure_nollm_tag(tags)
+            merged_ids = {int(value) for value in selected_tag_ids}
+            merged_ids.add(int(category_id))
+            merged_ids.add(int(no_llm_tag['id']))
+            # Preserve all existing tags unless the reviewer explicitly chooses the tag list;
+            # selected tags are additive to the document's existing tags.
+            merged_ids.update(int(value) for value in (doc.get('tags') or []))
+            update_payload = {
+                'title': title,
+                'tags': sorted(merged_ids),
+                'correspondent': corr_id
+            }
+            if date_value:
+                update_payload['created'] = date_value
+            response = requests.patch(
+                f'{PAPERLESS}/api/documents/{did}/',
+                headers={**paperless_headers(), 'Content-Type': 'application/json'},
+                json=update_payload, timeout=45
+            )
+            response.raise_for_status()
+
+            correspondent_name = safe_archive_component(corr_name)
+            # Release only after Paperless metadata update succeeds.
+            update_job_fields(job, {
+                'CATEGORY': category_name,
+                'CORRESPONDENT': correspondent_name,
+                'NOLLM_APPROVED': 'true',
+                'NOLLM_APPROVED_AT': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                'STATUS': 'PAPERLESS_DONE'
+            })
+            return redirect(url_for('index'))
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            error = f'Freigabe nicht abgeschlossen. Der Job bleibt in noLLM-Quarantäne. Details: {exc}'
+        finally:
+            fcntl.flock(shared_lock.fileno(), fcntl.LOCK_UN)
+            shared_lock.close()
+
+    current_tags = set(str(value) for value in (doc.get('tags') or []))
+    current_corr = str(doc.get('correspondent') or '')
+    return page('''
+    <article>
+      <h2>noLLM-Dokument {{did}}</h2>
+      <p>Gemini wird für dieses Dokument nicht verwendet. Erst nach dem Absenden werden die ausgewählten Metadaten übernommen und die Archivierung freigegeben.</p>
+      <p><a href="{{url_for('preview', did=did)}}" target="_blank" rel="noopener">Dokumentvorschau öffnen</a></p>
+      {% if error %}<p class="status-error">{{error}}</p>{% endif %}
+      <form method="post">
+        <input type="hidden" name="csrf" value="{{csrf}}">
+        <label>Dokumenttitel
+          <input name="title" maxlength="250" value="{{doc.title or ''}}" required>
+        </label>
+        <label>Hauptkategorie (vorhandener Paperless-Tag)
+          <select name="category" required>
+            <option value="">Bitte auswählen</option>
+            {% for t in tags %}<option value="{{t.id}}" {% if t.name == 'noLLM' %}disabled{% endif %}>{{t.name}}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Weitere Tags (Mehrfachauswahl; bestehende Tags bleiben erhalten)
+          <select name="tags" multiple size="8">
+            {% for t in tags %}<option value="{{t.id}}" {% if t.name == 'noLLM' %}selected disabled{% elif t.id|string in current_tags %}selected{% endif %}>{{t.name}}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Vorhandener Korrespondent
+          <select name="correspondent">
+            <option value="">— auswählen oder unten neu eingeben —</option>
+            {% for c in correspondents %}<option value="{{c.id}}" {% if c.id|string == current_corr %}selected{% endif %}>{{c.name}}</option>{% endfor %}
+          </select>
+        </label>
+        <label>Neuen Korrespondenten anlegen (optional; hat Vorrang vor Auswahl)
+          <input name="new_correspondent" maxlength="180" placeholder="Name des Korrespondenten">
+        </label>
+        <label>Dokumentdatum YYYY-MM-DD (optional)
+          <input name="date" type="date" value="{{(doc.created or '')[:10]}}">
+        </label>
+        <label><input style="display:inline;width:auto" type="checkbox" name="approve_date" value="yes"> Das oben angegebene Datum ausdrücklich als Paperless-Dokumentdatum übernehmen</label>
+        <button type="submit">Metadaten übernehmen und Archivierung freigeben</button>
+      </form>
+    </article>
+    ''', did=did, doc=doc, tags=tags, correspondents=correspondents,
+                current_tags=current_tags, current_corr=current_corr, error=error, csrf=session['csrf'])
 
 
 @app.route('/review/<int:did>', methods=['GET', 'POST'])
@@ -783,7 +1042,7 @@ def reapply():
 @app.route('/preview/<int:did>')
 @require_login
 def preview(did):
-    if not job_for_doc(did):
+    if not job_for_doc(did) and not job_for_nollm_doc(did):
         abort(404)
 
     response = requests.get(

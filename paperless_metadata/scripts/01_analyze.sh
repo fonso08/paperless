@@ -56,6 +56,17 @@ for resource in tags correspondents document_types; do
     pm_atomic_json "$PM_STATE/analysis/${resource}.json"
 done
 
+if ! NO_LLM_TAG_ID="$(pm_paperless_tag_id_by_name noLLM)"; then
+  pm_log ERROR "Paperless-Tag-Katalog konnte nicht sicher gelesen werden; Abbruch"
+  exit 1
+fi
+
+if [[ -n "$NO_LLM_TAG_ID" ]]; then
+  pm_log INFO "Schutz-Tag noLLM gefunden: ID $NO_LLM_TAG_ID"
+else
+  pm_log WARN "Tag noLLM fehlt; Gemini-Verarbeitung läuft ohne Tag-Filter weiter"
+fi
+
 if [[ "$mode" == id ]]; then
   ids="$value"
 else
@@ -93,11 +104,32 @@ while IFS= read -r id; do
   request_file="$(mktemp "${TMPDIR:-/tmp}/pm-request.XXXXXX")"
   proposal_file="$(mktemp "${TMPDIR:-/tmp}/pm-proposal.XXXXXX")"
 
-  if ! pm_paperless_document "$id" > "$document_file"; then
-    rm -f "$document_file" "$request_file" "$proposal_file"
-    ((failed+=1))
-    continue
-  fi
+
+if ! pm_paperless_document "$id" > "$document_file"; then
+  rm -f "$document_file" "$request_file" "$proposal_file"
+  pm_log ERROR "Dokument $id konnte nicht gelesen werden; keine Gemini-Anfrage"
+  ((failed+=1))
+  continue
+fi
+
+# Tag-Struktur prüfen; bei unerwarteter Antwort keine Gemini-Anfrage.
+if ! jq -e '.tags | type == "array"' \
+    "$document_file" >/dev/null 2>&1; then
+  rm -f "$document_file" "$request_file" "$proposal_file"
+  pm_log ERROR "Dokument $id: Tags nicht lesbar; keine Gemini-Anfrage"
+  ((failed+=1))
+  continue
+fi
+
+# Dokumente mit noLLM grundsätzlich nicht an Gemini senden.
+if [[ -n "$NO_LLM_TAG_ID" ]] && jq -e --argjson tag_id "$NO_LLM_TAG_ID" \
+    '(.tags | index($tag_id)) != null' \
+    "$document_file" >/dev/null; then
+  rm -f "$document_file" "$request_file" "$proposal_file"
+  pm_log INFO "Dokument $id wegen Tag noLLM übersprungen"
+  continue
+fi
+
 
   # OCR-Text begrenzen; die vollständige Länge wird separat gespeichert.
   jq -n \

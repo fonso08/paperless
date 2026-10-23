@@ -36,3 +36,18 @@ pm_paperless_catalog() {
   done
   cat "$tmp"; rm -f "$tmp"
 }
+
+pm_paperless_tag_id_by_name() {
+  local name="$1"
+  local catalog
+
+  catalog="$(pm_paperless_catalog tags)" || return 1
+
+  jq -r --arg name "$name" '
+    [.[] | select(.name == $name) | .id]
+    | if length == 0 then ""
+      elif length == 1 then .[0]
+      else error("Tag ist nicht eindeutig: " + $name)
+      end
+  ' <<< "$catalog"
+}

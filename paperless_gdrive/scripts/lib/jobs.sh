@@ -304,6 +304,7 @@ job_set_status() {
         PAPERLESS_PROCESSING|\
         GEMINI_PENDING|\
         GEMINI_FAILED|\
+        GEMINI_SKIPPED|\
         QUARANTINE|\
         REVIEW_APPROVED|\
         PAPERLESS_DONE|\
@@ -432,6 +433,7 @@ job_is_active() {
         PAPERLESS_PROCESSING|\
         GEMINI_PENDING|\
         GEMINI_FAILED|\
+        GEMINI_SKIPPED|\
         QUARANTINE|\
         REVIEW_APPROVED|\
         PAPERLESS_DONE|\
