@@ -1,32 +1,69 @@
 # Projektübergabe: Paperless-ngx, Gemini-Metadaten und Google-Drive-Automatisierung
 
-**Stand: 16. Oktober 2026**
+**Stand: 27. Oktober 2026**
 
 ## 1. Projektziel
 
-Ich möchte die bestehende Google-Drive-Automatisierung für Paperless-ngx um die bereits entwickelte Gemini-Metadatenanalyse, automatische Kategorisierung, Tag-Erkennung, Dateiumbenennung und Archivierung erweitern.
+Die bestehende Google-Drive-Automatisierung für Paperless-ngx soll mit der Gemini-Metadatenanalyse, automatischen Kategorisierung, Tag-Erkennung, Dateiumbenennung und Archivierung zusammenarbeiten.
 
-Ziel ist ein möglichst automatischer Prozess. Nur Dokumente mit unsicheren, unvollständigen oder widersprüchlichen Metadaten sollen manuell geprüft werden müssen.
+Ziel ist ein möglichst automatischer und zuverlässiger Prozess. Nur Dokumente mit unsicheren, unvollständigen, widersprüchlichen oder technisch fehlerhaften Metadaten sollen manuell geprüft werden müssen.
 
-Der gesamte Ablauf soll zuverlässig und nachvollziehbar sein. Quelldateien dürfen erst gelöscht werden, wenn der Upload in Google Drive erfolgreich abgeschlossen und verifiziert wurde und die ursprüngliche Drive-Datei nachweislich gelöscht werden konnte.
+Der gesamte Ablauf muss nachvollziehbar bleiben. Quelldateien dürfen erst gelöscht werden, wenn der Upload nach Google Drive erfolgreich abgeschlossen und verifiziert wurde und die ursprüngliche Drive-Datei nachweislich gelöscht werden konnte.
+
+Zusätzlich gibt es eine Quarantäne-Weboberfläche, über die unsichere Metadatenvorschläge manuell bearbeitet und freigegeben werden können.
+
+Ein weiterer Bestandteil ist die Behandlung von Dokumenten mit dem Tag `noLLM`. Diese Dokumente dürfen nicht an Gemini übergeben werden, sollen aber trotzdem in den vorgesehenen Prüf- und Archivierungsprozess integriert werden.
+
+**Grundprinzipien:**
+- Bestehende Skripte möglichst gezielt erweitern.
+- Zunächst den tatsächlichen Code untersuchen, bevor Änderungen vorgenommen werden.
+- Keine automatischen Freigaben bei unsicheren oder unvollständigen Metadaten.
+- Keine Änderungen an Paperless ohne den dafür vorgesehenen Freigabeprozess.
+- Keine produktiven Löschungen ohne ausdrückliche Freigabe und erfolgreiche Sicherheitsprüfungen.
 
 ## 2. Systemumgebung und verbindliche Pfade
 
-Raspberry Pi:
+### Raspberry Pi
+
 - Hostname: `rasp2`
 - Paperless-URL: `http://rasp2:1888`
 - Quarantäne-Weboberfläche: `http://rasp2:1889`
 
-Projektverzeichnisse:
-- Google-Drive-Automatisierung: `/home/pi/docker/paperless/paperless_gdrive`
-- Gemini-Metadatenprojekt: `/home/pi/docker/paperless/paperless_metadata`
-- Quarantäne-Webanwendung: `/home/pi/docker/paperless/quarantine_web`
+### Projektverzeichnisse
 
-Weitere wichtige Pfade:
-- Paperless-Datenverzeichnis: `/media/BlueDisc3/PAPERLESS`
-- Scanpool: `/media/BlueDisc3/PAPERLESS/scanpool`
-- Job-Dateien: `/media/BlueDisc3/PAPERLESS/state/jobs`
-- Gemini-Vorschläge: `/media/BlueDisc3/PAPERLESS/state/metadata/proposals`
+Google-Drive-Automatisierung:
+
+`/home/pi/docker/paperless/paperless_gdrive`
+
+Gemini-Metadatenprojekt:
+
+`/home/pi/docker/paperless/paperless_metadata`
+
+Quarantäne-Webanwendung:
+
+`/home/pi/docker/paperless/quarantine_web`
+
+### Weitere wichtige Pfade
+
+Paperless-Datenverzeichnis:
+
+`/media/BlueDisc3/PAPERLESS`
+
+Scanpool:
+
+`/media/BlueDisc3/PAPERLESS/scanpool`
+
+Job-Dateien:
+
+`/media/BlueDisc3/PAPERLESS/state/jobs`
+
+Zentrale Metadatenvorschläge:
+
+`/media/BlueDisc3/PAPERLESS/state/metadata/proposals`
+
+Die Metadatenanalyse verwendet außerdem ein projektinternes Verzeichnis:
+
+`/home/pi/docker/paperless/paperless_metadata/state/proposals`
 
 **Wichtig:** Der verbindliche Pfad der Google-Drive-Automatisierung lautet `/home/pi/docker/paperless/paperless_gdrive`. Nicht versehentlich `/home/pi/docker/paperless/paperless_gdrive_v7` verwenden.
 
@@ -34,24 +71,27 @@ Die Umgebung verwendet Docker, Paperless-ngx, PostgreSQL, Valkey und rclone. Als
 
 ## 3. Gewünschter Gesamtprozess
 
-Der vorgesehene Ablauf lautet:
+Der vorgesehene Ablauf ist:
 
-1. Eine neue Datei aus `gdrive:SCAN` erkennen.
-2. Die Datei in den lokalen Scanpool übernehmen.
-3. Das Dokument an Paperless-ngx übergeben.
-4. Gemini analysiert den Inhalt und schlägt Metadaten vor.
-5. Die Vorschläge anhand definierter Qualitätskriterien validieren.
-6. Bei geeigneten Vorschlägen die Metadaten automatisch in Paperless übernehmen.
-7. Dateinamen anhand der bestehenden Namensregeln erzeugen.
-8. Das Dokument nach `gdrive:PAPERLESS/Hauptkategorie/Korrespondent/` archivieren.
-9. Den Upload durch einen Vergleich der Dateigrößen überprüfen.
-10. Erst nach bestätigtem Upload die ursprüngliche Datei in `gdrive:SCAN` löschen und die Löschung überprüfen.
-11. Anschließend die lokale Quelldatei löschen.
-12. Den Job mit nachvollziehbarem Status abschließen.
+1. Neue Dateien in `gdrive:SCAN` erkennen.
+2. Dateien in den lokalen Scanpool übernehmen.
+3. Dokumente an Paperless-ngx übergeben.
+4. Prüfen, ob das Dokument mit `noLLM` markiert ist.
+5. Bei normalen Dokumenten Gemini zur Analyse verwenden, sofern noch kein gültiger Vorschlag vorhanden ist.
+6. Bei `noLLM` keine Gemini-Analyse durchführen und gegebenenfalls einen Platzhalter für die manuelle Prüfung erzeugen.
+7. Metadatenvorschläge anhand definierter Qualitätskriterien validieren.
+8. Geeignete Vorschläge nach den festgelegten Freigaberegeln übernehmen.
+9. Unsichere Fälle in Quarantäne stellen.
+10. Dateinamen anhand der bestehenden Namensregeln erzeugen.
+11. Dokumente nach `gdrive:PAPERLESS/Hauptkategorie/Korrespondent/` archivieren.
+12. Den Upload durch einen Vergleich der Dateigrößen verifizieren.
+13. Erst nach bestätigtem Upload die ursprüngliche Datei in `gdrive:SCAN` löschen und die Löschung überprüfen.
+14. Anschließend die lokale Quelldatei löschen.
+15. Den Job mit einem nachvollziehbaren Status abschließen.
 
-Unsichere oder fehlerhafte Fälle sollen in Quarantäne verbleiben und über die Weboberfläche geprüft werden können.
+Bei technischen Fehlern, ungültigen Vorschlägen oder erforderlicher manueller Prüfung darf der Ablauf nicht unkontrolliert fortgesetzt werden.
 
-## 4. Hauptkategorien
+## 4. Hauptkategorien und Archivstruktur
 
 Die bestätigten 13 Hauptkategorien sind:
 
@@ -69,9 +109,9 @@ Die bestätigten 13 Hauptkategorien sind:
 - Freizeit
 - Sonstiges
 
-Weitere Tags beschreiben den Dokumenttyp oder den konkreten Inhalt. Beispiele sind `Rechnung`, `Handwerker`, `Kündigung` oder `Mitgliedschaft`.
+Weitere Tags beschreiben Dokumenttyp oder Inhalt, beispielsweise Rechnung, Handwerker, Kündigung oder Mitgliedschaft.
 
-Die gewünschte Archivstruktur ist:
+Die gewünschte Archivstruktur lautet:
 
 `gdrive:PAPERLESS/Hauptkategorie/Korrespondent/Dateiname.pdf`
 
@@ -87,15 +127,20 @@ Projektpfad:
 
 Wichtige Komponenten:
 
-- `scripts/01_analyze.sh`: analysiert Dokumente und erstellt Gemini-Vorschläge.
-- `scripts/03_apply_proposals.sh`: validiert und übernimmt Vorschläge in Paperless.
-- `config/classification_prompt.txt`: enthält die Klassifizierungsregeln.
-- `state/proposals/`: enthält die Analysevorschläge im Projektverzeichnis.
-- Die zentral verwendeten Vorschläge der Drive-Automatisierung liegen unter `/media/BlueDisc3/PAPERLESS/state/metadata/proposals/`.
+- `scripts/01_analyze.sh`: Analysiert Dokumente und erstellt Vorschläge.
+- `scripts/03_apply_proposals.sh`: Validiert und übernimmt Vorschläge in Paperless.
+- `config/classification_prompt.txt`: Enthält die Klassifizierungsregeln.
+- `state/proposals/`: Enthält die projektinternen Analysevorschläge.
 
-Das Analyse-Skript arbeitet zunächst ohne Änderungen an Paperless. Änderungen werden durch das Apply-Skript mit `--apply` ausdrücklich ausgelöst.
+Die zentrale Ablage der Vorschläge für die Drive-Automatisierung befindet sich unter:
 
-Die Vorschläge enthalten relevante Felder wie:
+`/media/BlueDisc3/PAPERLESS/state/metadata/proposals/`
+
+Das Analyse-Skript arbeitet grundsätzlich ohne Änderungen an Paperless. Das Apply-Skript nimmt Änderungen erst bei ausdrücklicher Verwendung von `--apply` vor.
+
+### Aufbau der Vorschläge
+
+Relevante Felder befinden sich unter `.proposal`, insbesondere:
 
 - `.proposal.primary_tag`
 - `.proposal.additional_tags`
@@ -106,48 +151,226 @@ Die Vorschläge enthalten relevante Felder wie:
 - `.proposal.review_decision`
 - `.proposal.validation_warnings`
 
-Die Angaben liegen unter `.proposal`, nicht auf der obersten Ebene des JSON-Objekts.
+Weitere Felder können den Analyseprovider, das Modell, den Analysezeitpunkt und den Übernahmestatus dokumentieren.
 
-Ein Vorschlag kann zusätzlich Informationen zu manueller Prüfung und Übernahme enthalten, etwa `.manual_review.approved_at` und `.applied`.
+Die manuelle Freigabe wird unter anderem über `.manual_review.approved_at` dokumentiert.
 
-## 6. Zentrales Archivierungsskript
+**Wichtig:** Die Felder unter `.proposal` liegen im JSON-Objekt verschachtelt. Bei der Verarbeitung darf nicht versehentlich angenommen werden, dass `primary_tag` oder `requires_review` auf der obersten JSON-Ebene stehen.
+
+## 6. Neue Funktion: Dokumente mit `noLLM`
+
+Dokumente mit dem Tag `noLLM` sollen nicht an Gemini gesendet werden.
+
+Der Tag kennzeichnet Dokumente, die ausdrücklich ohne LLM-Analyse behandelt werden sollen. Das Fehlen einer Gemini-Analyse darf nicht dazu führen, dass diese Dokumente unberücksichtigt bleiben.
+
+### Gewünschtes Verhalten
+
+1. `01_analyze.sh` erkennt den Tag `noLLM`.
+2. Für diese Dokumente wird keine Gemini-Anfrage ausgelöst.
+3. Existiert bereits ein gültiger Vorschlag, darf dieser nicht unnötig überschrieben werden.
+4. Fehlt ein Vorschlag, soll ein Platzhalter für die manuelle Bearbeitung erzeugt werden.
+5. Der Platzhalter muss eindeutig als manuell zu bearbeitender Vorschlag erkennbar sein.
+6. Ein Platzhalter darf nicht als gültiger, automatisch freigegebener Gemini-Vorschlag behandelt werden.
+7. Die erforderlichen Job- und Vorschlagsdateien müssen für die nachfolgenden Prozesse vorhanden sein.
+8. Die weitere Verarbeitung erfolgt über die vorgesehenen Freigabe- und Quarantäneregeln.
+
+### Beispiel: Platzhalter für Dokument 1076
+
+Am 27. Oktober 2026 wurde folgender Vorschlag für Dokument 1076 vorgelegt:
 
 Datei:
 
+`/media/BlueDisc3/PAPERLESS/state/metadata/proposals/1076.json`
+
+Wesentliche Inhalte:
+
+- `document_id`: `1076`
+- Titel: `scan`
+- Originaldateiname: `scan.pdf`
+- Dokumentdatum: `2026-10-27`
+- Provider: `none`
+- Modell: `manual-noLLM`
+- `requires_review`: `true`
+- `review_decision`: `manual_check`
+- Warnung: `Tag noLLM: keine Gemini-Analyse; manuelle Bearbeitung erforderlich`
+- `applied`: `false`
+
+Der Platzhalter enthält bewusst keine automatisch bestimmte Hauptkategorie. Die fehlende Hauptkategorie muss durch die manuelle Bearbeitung ergänzt werden.
+
+Dieser Vorschlag ist **kein automatisch freigegebener Vorschlag**. Er darf nicht allein deshalb angewendet oder archiviert werden, weil die JSON-Datei vorhanden ist.
+
+### Noch offene Frage
+
+Dokument 1076 wurde in der Quarantäne-Weboberfläche zunächst nicht angezeigt.
+
+Die Ursache ist noch nicht abschließend geklärt. Der Vorschlag ist vorhanden, aber das Vorhandensein der JSON-Datei allein garantiert nicht, dass die Weboberfläche das Dokument in ihrer Liste darstellt.
+
+Deshalb muss zuerst die tatsächliche Filter- und Ladefunktion der Webanwendung geprüft werden. Eine künstlich eingetragene Hauptkategorie oder eine andere Änderung, die das Dokument lediglich sichtbar macht, ist keine geeignete Lösung, solange dadurch falsche Metadaten oder eine ungewollte Freigabe entstehen könnten.
+
+Die bisherige Arbeit konzentriert sich auf `01_analyze.sh` und die Anzeige in der Quarantäne-Weboberfläche. `fix_nollm_optional_tag.sh` ist ausdrücklich nicht Bestandteil des aktuellen Änderungsumfangs.
+
+## 7. Zentrales Archivierungsskript und Jobverarbeitung
+
+Das Archivierungsskript integriert die Metadatenanalyse in den Drive-Prozess.
+
+Der aktuell verbindliche Projektpfad ist:
+
+`/home/pi/docker/paperless/paperless_gdrive`
+
+Vor Änderungen muss geprüft werden, welches Archivierungsskript tatsächlich produktiv verwendet wird. In älteren Projektbeschreibungen wurde folgender Dateiname genannt:
+
 `/home/pi/docker/paperless/paperless_gdrive/scripts/03_archive_to_gdrive.sh`
 
-Die Funktion `metadata_process_job()` integriert die Gemini-Metadaten in den Archivierungsablauf.
+Im aktuellen Projektverlauf existieren außerdem Skripte mit abweichenden Dateinamen. Deshalb darf nicht ohne Prüfung angenommen werden, dass der ältere Dateiname noch der aktive Einstiegspunkt ist.
 
-Der bestehende Code:
-- prüft, ob ein Vorschlag vorhanden ist;
-- startet gegebenenfalls `01_analyze.sh`;
-- kontrolliert die Gültigkeit des Vorschlags;
-- ruft `03_apply_proposals.sh --id ... --apply` auf, wenn die Übernahme noch aussteht;
-- liest die Metadaten aus Paperless;
-- bestimmt Hauptkategorie, Korrespondent und Archivdateinamen;
-- setzt die Jobinformationen für die anschließende Archivierung.
+Die Metadatenverarbeitung übernimmt grundsätzlich folgende Aufgaben:
 
-Der Dateiname wird aus Dokumentdatum, Kategorie, Korrespondent und Titel erzeugt. Die Dokument-ID wird zur eindeutigen Zuordnung ergänzt.
+- Vorhandensein eines Vorschlags prüfen.
+- Gegebenenfalls die Analyse starten.
+- Vorschlag validieren.
+- Erforderliche Übernahme in Paperless auslösen.
+- Metadaten aus Paperless lesen.
+- Hauptkategorie und Korrespondent bestimmen.
+- Archivdateinamen erzeugen.
+- Jobstatus und Archivierungsinformationen aktualisieren.
+- Bei Unsicherheit in Quarantäne wechseln.
 
-Das Archivierungsskript verwendet Jobstatuswerte wie:
+Die konkreten Statusübergänge müssen vor Änderungen am produktiven Code geprüft werden.
+
+### Relevante Jobstatuswerte
+
+Im Projekt kommen unter anderem folgende Statuswerte vor:
+
 - `PAPERLESS_DONE`
 - `ARCHIVE_PROCESSING`
 - `ARCHIVE_FAILED`
 - `COMPLETE`
 - `QUARANTINE`
 - `GEMINI_FAILED`
+- `REVIEW_APPROVED`
 
-Die konkreten Statusübergänge müssen bei Änderungen am bestehenden Code berücksichtigt werden.
+Die genaue Bedeutung und die zulässigen Übergänge sind anhand der aktuell verwendeten Skripte zu prüfen.
 
-## 7. Sicherheitsregeln für die Archivierung
+## 8. Neue Funktion: Manuelle Quarantäneprüfung über die Weboberfläche
+
+Die Quarantäne-Webanwendung befindet sich unter:
+
+`/home/pi/docker/paperless/quarantine_web`
+
+Die Weboberfläche ist unter folgender Adresse vorgesehen:
+
+`http://rasp2:1889`
+
+Die zentrale Datei ist:
+
+`/home/pi/docker/paperless/quarantine_web/app.py`
+
+Die Anwendung soll Dokumente anzeigen, die manuell geprüft werden müssen. Die verantwortliche Person kann Metadaten korrigieren und einen Vorschlag ausdrücklich freigeben.
+
+### Bekannte Funktionen im Code
+
+Die bisherige Codeprüfung hat folgende Anhaltspunkte ergeben:
+
+- Zeile 30: Definition des Vorschlagsverzeichnisses `PROPOSALS`.
+- Zeile 41: Verweis auf `scripts/03_apply_proposals.sh`.
+- Zeile 178: Prüfung auf Jobstatus `QUARANTINE`.
+- Zeile 404: Erneute Prüfung des Quarantänestatus.
+- Zeile 414: Erzeugung eines Eintrags mit einer Kategorie aus `proposal.get('primary_tag', '')`.
+- Zeilen 649–653: Erzeugung beziehungsweise Aktualisierung eines Vorschlags mit `requires_review=False`.
+- Zeilen 668–685: Prüfung des Jobstatus und Eintragung der manuellen Freigabe; dabei wird auch `REVIEW_APPROVED` gesetzt.
+- Zeilen 726–741: Anzeige von `requires_review` und Eingabefeld für die Hauptkategorie.
+- Zeilen 810–863: Validierung und Verarbeitung eines Freigabevorgangs.
+- Zeile 972: Anzeige der Hauptkategorie.
+
+Diese Zeilenangaben stammen aus einer vorliegenden `grep`-Ausgabe. Sie ersetzen keine Prüfung des vollständigen aktuellen Codes und müssen bei der nächsten Analyse im Zusammenhang betrachtet werden.
+
+### Geplantes Freigabeverhalten
+
+Bei einer manuellen Freigabe sollen:
+
+1. die Metadaten auf Vollständigkeit und Gültigkeit geprüft werden;
+2. die Hauptkategorie und gegebenenfalls weitere Metadaten ergänzt werden;
+3. die vorgesehenen Freigabefelder gesetzt werden;
+4. die Freigabe in `.manual_review.approved_at` dokumentiert werden;
+5. der Jobstatus nachvollziehbar aktualisiert werden;
+6. die regulären Apply- und Archivierungsprozesse weiterarbeiten können.
+
+Die manuelle Freigabe darf nicht die Sicherheitsprüfungen für Upload, Verifikation und Löschung umgehen.
+
+### Offene Diagnose: Dokument 1076 wird nicht angezeigt
+
+Der nächste Schritt ist die gezielte Untersuchung der relevanten Abschnitte in `app.py`, insbesondere:
+
+- etwa Zeilen 160–190: Ermittlung der Quarantänejobs;
+- etwa Zeilen 390–425: Zusammenstellung der angezeigten Dokumente;
+- etwa Zeilen 630–690: Verarbeitung einer manuellen Freigabe;
+- etwa Zeilen 800–875: Validierung und Freigabevorgang.
+
+Dabei ist zu klären:
+
+- Ob die Weboberfläche ausschließlich Jobs mit `STATUS=QUARANTINE` anzeigt.
+- Wie die JSON-Vorschläge geladen und ausgewertet werden.
+- Ob die Weboberfläche den verschachtelten Aufbau des Vorschlags korrekt berücksichtigt.
+- Ob ein Vorschlag ohne `primary_tag` angezeigt werden kann.
+- Ob Dokument 1076 einen zugehörigen Job besitzt und dieser tatsächlich den Status `QUARANTINE` hat.
+- Ob die Anwendung den Vorschlag wegen eines fehlenden Feldes ausfiltert oder bei der Darstellung überspringt.
+
+Erst nach dieser Prüfung soll eine gezielte Korrektur vorbereitet werden.
+
+**Wichtig:** Die Diagnose darf nicht durch das Setzen erfundener Metadaten oder durch eine automatische Freigabe umgangen werden.
+
+## 9. Regeln für die automatische Verarbeitung sicherer Vorschläge
+
+Die automatische Freigabe geeigneter Gemini-Vorschläge bleibt eine wichtige offene Aufgabe.
+
+Der bestehende Archivierungsablauf prüft unter anderem:
+
+- `.manual_review.approved_at`
+- `proposal.requires_review`
+- `proposal.review_decision`
+- `proposal.validation_warnings`
+- `proposal.primary_tag`
+
+Bisher werden Jobs ohne dokumentierte manuelle Freigabe teilweise in Quarantäne gestellt. Dadurch können auch sichere Vorschläge blockiert werden, obwohl sie grundsätzlich automatisch verarbeitet werden könnten.
+
+### Gewünschtes Verhalten für sichere Vorschläge
+
+Ein Dokument soll ohne manuelle Freigabe weiterverarbeitet werden können, wenn:
+
+- ein vollständiger, gültiger Vorschlag vorhanden ist;
+- eine gültige Hauptkategorie gesetzt ist;
+- die Konfidenz ausreichend hoch ist;
+- keine Validierungswarnungen vorliegen;
+- `requires_review=false` gilt;
+- `review_decision=no_check_needed` gilt;
+- die notwendigen Metadaten plausibel und widerspruchsfrei sind.
+
+### Fälle, die weiterhin in Quarantäne gehören
+
+Eine manuelle Prüfung bleibt erforderlich, wenn:
+
+- die Konfidenz zu niedrig oder nicht vorhanden ist;
+- die Hauptkategorie fehlt oder ungültig ist;
+- Validierungswarnungen vorhanden sind;
+- Angaben widersprüchlich oder unvollständig sind;
+- Gemini eine manuelle Prüfung verlangt;
+- Analyse, Validierung oder Übernahme technisch fehlschlagen;
+- ein `noLLM`-Platzhalter noch nicht manuell vervollständigt und freigegeben wurde.
+
+Eine Konfidenzgrenze von beispielsweise `0.90` ist ein möglicher Ausgangspunkt, aber keine bestätigte Projektentscheidung. Vor einer Implementierung müssen bestehende Konfigurationen und Qualitätsregeln geprüft werden.
+
+Die automatische Freigabe darf nicht dadurch realisiert werden, dass bei allen Dokumenten pauschal ein Zeitstempel für die manuelle Freigabe gesetzt wird.
+
+## 10. Sicherheitsregeln für die Archivierung
 
 Die bestehenden Sicherheitsprüfungen dürfen nicht geschwächt werden.
 
-Der Upload erfolgt mit rclone. Danach werden lokale und entfernte Dateigröße verglichen. Nur bei erfolgreicher Verifikation wird `ARCHIVE_VERIFIED=true` gesetzt.
+Der Upload erfolgt mit rclone. Danach werden die lokale und die entfernte Dateigröße verglichen. Nur bei erfolgreicher Verifikation wird `ARCHIVE_VERIFIED=true` gesetzt.
 
-Anschließend wird die ursprüngliche Datei in Google Drive gelöscht und die Löschung überprüft. Erst danach wird die lokale Quelldatei entfernt.
+Anschließend wird die ursprüngliche Datei in Google Drive gelöscht und die Löschung überprüft. Erst danach darf die lokale Quelldatei entfernt werden.
 
-Wichtige Jobfelder:
+### Wichtige Jobfelder
+
 - `ARCHIVE_TARGET`
 - `ARCHIVE_FILE`
 - `ARCHIVE_VERIFIED`
@@ -158,7 +381,7 @@ Wichtige Jobfelder:
 - `ERROR_MESSAGE`
 - `COMPLETED_AT`
 
-Eine erfolgreiche Archivierung muss unter anderem durch folgende Werte nachvollziehbar sein:
+Eine erfolgreich abgeschlossene Archivierung muss unter anderem durch folgende Werte nachvollziehbar sein:
 
 - `ARCHIVE_VERIFIED=true`
 - `GDRIVE_SOURCE_DELETED=true`
@@ -167,48 +390,51 @@ Eine erfolgreiche Archivierung muss unter anderem durch folgende Werte nachvollz
 
 Bei Fehlern darf keine ungesicherte Löschung erfolgen.
 
-## 8. Erfolgreicher produktiver End-to-End-Test mit Dokument 687
+## 11. Erfolgreicher End-to-End-Test mit Dokument 687
 
-Am 16.10.2026 wurde der vollständige produktive Ablauf für Dokument 687 ausdrücklich freigegeben und erfolgreich abgeschlossen.
+Am 16. Oktober 2026 wurde der vollständige produktive Ablauf für Dokument 687 ausdrücklich freigegeben und erfolgreich abgeschlossen.
 
 Job-ID:
 
 `e05a5c8c-2a1c-4a14-a874-f0d8137f1b15`
 
-Die ursprüngliche Datei in Google Drive war:
+Ursprüngliche Datei in Google Drive:
 
 `gdrive:SCAN/Zuletzt am 16.10.2026, 13:25:26 geprüft.pdf`
 
-Die lokale Scanpool-Datei war:
+Lokale Scanpool-Datei:
 
 `/media/BlueDisc3/PAPERLESS/scanpool/Zuletzt am 16.10.2026, 13-25-26 geprüft.pdf`
 
-Gemini schlug folgende Metadaten vor:
+### Gemini-Vorschlag
+
 - Dokument-ID: `687`
 - Hauptkategorie: `Wohnen`
-- zusätzliche Tags: `Rechnung`, `Handwerker`
+- Zusätzliche Tags: `Rechnung`, `Handwerker`
 - Korrespondent: `André Peters`
 - Dokumentdatum: `2012-10-08`
 - Konfidenz: `0.95`
 - `requires_review=false`
 - `review_decision=no_check_needed`
-- keine Validierungswarnungen
+- Keine Validierungswarnungen
 
-Der Archivpfad lautete:
+Archivpfad:
 
 `gdrive:PAPERLESS/Wohnen/André_Peters/20121008_Wohnen_André_Peters_Zuletzt_am_16.10.2026,_13-25-26_geprüft_ID-687.pdf`
 
-Der Test verlief erfolgreich:
-1. Vorschlag wurde übernommen.
-2. Metadaten wurden in Paperless angewendet.
-3. Archivdateiname und Zielverzeichnis wurden erzeugt.
-4. Datei wurde nach Google Drive hochgeladen.
-5. Lokale und entfernte Dateigröße wurden erfolgreich verglichen: jeweils `1.510.433` Byte.
-6. Die ursprüngliche Drive-Datei wurde gelöscht und die Löschung überprüft.
-7. Die lokale Quelldatei wurde gelöscht.
-8. Der Job wurde mit Status `COMPLETE` abgeschlossen.
+### Testergebnis
+
+- Vorschlag wurde übernommen.
+- Metadaten wurden in Paperless angewendet.
+- Archivdateiname und Zielverzeichnis wurden erzeugt.
+- Datei wurde nach Google Drive hochgeladen.
+- Lokale und entfernte Dateigröße wurden erfolgreich verglichen: jeweils `1.510.433 Byte`.
+- Die ursprüngliche Drive-Datei wurde gelöscht und die Löschung überprüft.
+- Die lokale Quelldatei wurde gelöscht.
+- Der Job wurde mit `COMPLETE` abgeschlossen.
 
 Endstatus:
+
 - `ARCHIVE_VERIFIED=true`
 - `GDRIVE_SOURCE_DELETED=true`
 - `LOCAL_SOURCE_DELETED=true`
@@ -217,76 +443,107 @@ Endstatus:
 - `ERROR_MESSAGE` leer
 - `COMPLETED_AT=2026-10-16T15:06:19+02:00`
 
-**Wichtige Einschränkung:** Dieser Test wurde mit einem ausdrücklich manuell freigegebenen Dokument durchgeführt. Er bestätigt den produktiven Ende-zu-Ende-Ablauf, aber noch nicht die automatische Verarbeitung ohne manuelle Freigabe.
+Dieser Test bestätigt den produktiven Ende-zu-Ende-Ablauf für ein ausdrücklich freigegebenes Dokument. Er beweist noch nicht, dass sichere Dokumente bereits ohne manuelle Freigabe automatisch verarbeitet werden.
 
-Dokument 687 ist bereits abgeschlossen. Die Quelldateien wurden gelöscht und dürfen nicht erneut als Test verwendet werden.
+**Dokument 687 ist abgeschlossen. Die Quelldateien wurden gelöscht und dürfen nicht erneut als Test verwendet werden.**
 
-## 9. Wichtigste offene Aufgabe: Automatische Freigabe sicherer Vorschläge
+## 12. Nächste Schritte
 
-Derzeit verlangt `metadata_process_job()` im Skript `03_archive_to_gdrive.sh` einen Zeitstempel in:
+Die weitere Arbeit soll in dieser Reihenfolge erfolgen.
 
-`.manual_review.approved_at`
+### Schritt 1: Anzeigeproblem von Dokument 1076 untersuchen
 
-Fehlt dieser Zeitstempel, wird der Job in Quarantäne gestellt. Damit werden auch sichere Vorschläge ohne manuelle Freigabe blockiert.
+Zunächst den tatsächlichen Code der Quarantäne-Weboberfläche lesen.
 
-Der bestehende Code prüft außerdem bereits:
-- `proposal.requires_review == false`
-- `proposal.review_decision == "no_check_needed"`
-- leere `proposal.validation_warnings`
-- vorhandene `proposal.primary_tag`
+Besonders relevant sind:
 
-Die manuelle Freigabe soll künftig nur für Dokumente erforderlich sein, die tatsächlich eine manuelle Prüfung benötigen.
+- die Filterung nach Jobstatus;
+- das Laden der Vorschlagsdateien;
+- die Verwendung von `primary_tag`;
+- die Behandlung fehlender Metadaten;
+- die Voraussetzungen für die Darstellung eines Quarantäneeintrags.
 
-### Gewünschte automatische Verarbeitung
+Zusätzlich müssen die Jobdatei und der aktuelle Status von Dokument 1076 geprüft werden.
 
-Ein Dokument darf ohne manuelle Freigabe weiterlaufen, wenn:
-- ein vollständiger, gültiger Vorschlag vorhanden ist;
-- eine gültige Hauptkategorie gesetzt ist;
-- die Konfidenz ausreichend hoch ist;
-- keine Validierungswarnungen vorliegen;
-- `requires_review=false` gilt;
-- `review_decision=no_check_needed` gilt;
-- die notwendigen Metadaten plausibel sind.
+Bis zur Klärung keine Änderungen vornehmen, die den Vorschlag automatisch freigeben oder mit erfundenen Metadaten ergänzen.
 
-### Weiterhin Quarantäne
+### Schritt 2: `noLLM`-Verhalten in `01_analyze.sh` prüfen
 
-Eine manuelle Prüfung bleibt notwendig, wenn:
-- die Konfidenz zu niedrig oder nicht vorhanden ist;
-- die Hauptkategorie fehlt oder ungültig ist;
-- Validierungswarnungen vorhanden sind;
-- Angaben widersprüchlich oder unvollständig sind;
-- Gemini eine Prüfung verlangt;
-- die Analyse, Validierung oder Übernahme technisch fehlschlägt.
+Datei:
 
-Eine Konfidenzgrenze von beispielsweise `0.90` ist ein möglicher Ausgangspunkt, aber noch keine endgültig bestätigte Projektentscheidung. Zunächst soll geprüft werden, ob es bereits einen entsprechenden Konfigurationswert oder weitere relevante Qualitätsregeln gibt.
+`/home/pi/docker/paperless/paperless_metadata/scripts/01_analyze.sh`
 
-## 10. Nächste Schritte
+Prüfen, ob:
 
-Bitte arbeite in dieser Reihenfolge weiter:
+- `noLLM` zuverlässig erkannt wird;
+- keine Gemini-Anfrage für solche Dokumente erfolgt;
+- vorhandene gültige Vorschläge erhalten bleiben;
+- fehlende Vorschläge als manuelle Platzhalter erzeugt werden;
+- Platzhalter nicht automatisch freigegeben werden;
+- die Vorschlagsdateien für nachfolgende Prozesse korrekt abgelegt werden.
 
-1. Den aktuellen Code rund um `metadata_process_job()` in `scripts/03_archive_to_gdrive.sh` prüfen, insbesondere die Prüfung von `.manual_review.approved_at`.
-2. Die vorhandene Konfiguration und weitere Skripte nach bereits existierenden Konfidenzgrenzen oder Regeln für automatische Freigaben durchsuchen.
-3. Vor Änderungen eine Sicherung des aktuellen Skripts erstellen.
-4. Die kleinstmögliche Änderung vorbereiten, damit sichere Vorschläge ohne manuelle Freigabe verarbeitet werden können.
-5. Den Diff überprüfen und sicherstellen, dass die bestehende Quarantänelogik für unsichere Fälle erhalten bleibt.
-6. Ein anderes, noch nicht verarbeitetes Dokument auswählen, dessen Quelle noch existiert.
-7. Zunächst die Metadatenentscheidung und Statusübergänge kontrolliert testen.
-8. Den vollständigen produktiven Ablauf nur mit entsprechender Freigabe testen.
-9. Dokumentieren, ob sichere Dokumente automatisch durchlaufen und unsichere weiterhin in Quarantäne landen.
+Das Skript zunächst nur untersuchen. Änderungen erst nach Sicherung und nachvollziehbarem Diff vorbereiten.
 
-Das Ziel ist ein zuverlässiger automatischer Ablauf mit möglichst wenigen manuellen Prüfungen. Es soll kein unnötiger Neuaufbau stattfinden.
+`fix_nollm_optional_tag.sh` bleibt vorerst außerhalb des Änderungsumfangs.
 
-## 11. Arbeitsweise
+### Schritt 3: Automatische Freigabe sicherer Gemini-Vorschläge untersuchen
 
-Bitte:
-- pragmatisch und schrittweise vorgehen;
-- zunächst den tatsächlichen Code prüfen, statt Annahmen zu treffen;
-- bestehende Skripte möglichst gezielt ändern;
-- konkrete Shell-Befehle bereitstellen, die auf dem Raspberry Pi ausgeführt werden können;
-- vor produktiven Änderungen Backups und nachvollziehbare Diffs verwenden;
-- keine Pfade oder Dateiinhalte erfinden;
-- die Quarantänelogik für unsichere Dokumente erhalten;
-- die Upload-Verifikation und Löschsicherung niemals umgehen;
-- keine produktiven Änderungen oder Löschungen ohne entsprechende Freigabe durchführen.
+Das tatsächlich produktiv verwendete Archivierungsskript ermitteln und dessen Freigabelogik prüfen.
 
-**Beginne im neuen Chat mit der gezielten Prüfung der aktuellen Freigabeprüfung in `03_archive_to_gdrive.sh`.** Die erste Aufgabe ist, die vorhandene Logik und Konfiguration zu lesen und anschließend eine möglichst kleine, sichere Änderung für die automatische Verarbeitung geeigneter Vorschläge vorzubereiten.
+Anschließend die vorhandenen Konfigurationen und Skripte nach bereits definierten Konfidenzgrenzen und Qualitätsregeln durchsuchen.
+
+Vor Änderungen ein Backup anlegen und die kleinstmögliche Anpassung vorbereiten.
+
+### Schritt 4: Kontrollierte Tests durchführen
+
+Ein noch nicht verarbeitetes Dokument auswählen, dessen Quelldatei weiterhin vorhanden ist.
+
+Zuerst die Metadatenentscheidung und die Statusübergänge kontrolliert testen. Dabei prüfen:
+
+- sichere Vorschläge;
+- unsichere Vorschläge;
+- fehlende oder ungültige Metadaten;
+- `noLLM`-Platzhalter;
+- manuelle Freigabe über die Weboberfläche.
+
+Den vollständigen produktiven Ablauf nur mit ausdrücklicher Freigabe testen.
+
+### Schritt 5: Ergebnis dokumentieren
+
+Nach den Tests festhalten:
+
+- ob sichere Dokumente automatisch weiterverarbeitet werden;
+- ob unsichere Dokumente zuverlässig in Quarantäne bleiben;
+- ob `noLLM`-Dokumente ohne Gemini-Anfrage verarbeitet werden;
+- ob Platzhalter in der Weboberfläche sichtbar sind;
+- ob manuelle Korrektur und Freigabe funktionieren;
+- ob Upload-Verifikation und Löschsicherung unverändert greifen.
+
+## 13. Verbindliche Arbeitsweise
+
+Bei allen weiteren Arbeiten gelten folgende Regeln:
+
+1. Pragmatisch und schrittweise vorgehen.
+2. Zuerst den tatsächlichen Code und die aktuelle Konfiguration prüfen.
+3. Keine Annahmen über aktive Dateinamen, Statusübergänge oder JSON-Strukturen treffen.
+4. Bestehende Skripte möglichst gezielt ändern.
+5. Vor produktiven Änderungen Backups anlegen.
+6. Änderungen anhand nachvollziehbarer Diffs überprüfen.
+7. Konkrete Shell-Befehle für die Ausführung auf `rasp2` bereitstellen.
+8. Die Quarantänelogik für unsichere Fälle erhalten.
+9. `noLLM`-Dokumente niemals ungefragt an Gemini übergeben.
+10. Platzhalter nicht als gültige, automatisch freigegebene Vorschläge behandeln.
+11. Upload-Verifikation und Löschsicherung niemals umgehen.
+12. Keine produktiven Änderungen oder Löschungen ohne entsprechende Freigabe durchführen.
+13. Abgeschlossene Testdokumente nicht erneut als Testquellen verwenden.
+14. Keine Änderungen an nicht ausdrücklich freigegebenen Komponenten vornehmen.
+
+## 14. Ausgangspunkt für die nächste Arbeitssitzung
+
+Die unmittelbar nächste Aufgabe ist die **gezielte Prüfung der Quarantäne-Weboberfläche, um zu erklären, warum Dokument 1076 trotz vorhandener noLLM-Platzhalterdatei nicht angezeigt wird**.
+
+Danach soll die Behandlung von `noLLM` in `01_analyze.sh` überprüft und gegebenenfalls gezielt korrigiert werden.
+
+Die automatische Freigabe sicherer Gemini-Vorschläge bleibt eine separate Aufgabe. Sie soll erst nach Prüfung des tatsächlichen produktiven Archivierungsskripts und der vorhandenen Konfiguration vorbereitet werden.
+
+Ziel bleibt ein zuverlässiger, nachvollziehbarer Automatisierungsprozess mit möglichst wenigen manuellen Prüfungen, ohne die Sicherheit der Metadatenübernahme und Archivierung zu beeinträchtigen.
