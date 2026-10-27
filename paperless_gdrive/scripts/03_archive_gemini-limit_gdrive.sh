@@ -60,6 +60,29 @@ fi
 METADATA_ROOT="${METADATA_ROOT:-/home/pi/docker/paperless/paperless_metadata}"
 METADATA_STATE="${STATE_DIR}/metadata"
 
+# Importquelle pro Job: fehlender Wert bedeutet bestehender GDrive-Workflow.
+# Direktimporte verwenden eine Paperless-Originaldatei nur als lesbare Quelle.
+is_direct_import() {
+    [[ "${IMPORT_SOURCE:-GDRIVE}" == "PAPERLESS_DIRECT" ]]
+}
+
+# Zusaetzlicher, importquellenunabhaengiger Loeschschutz.
+is_paperless_media_file() {
+    local candidate="${1:-}" resolved
+    [[ -n "$candidate" ]] || return 1
+    resolved="$(realpath -m -- "$candidate")" || return 1
+    case "$resolved" in
+        /media/BlueDisc3/PAPERLESS/media/documents/*|/usr/src/paperless/media/documents/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# noLLM kann aus einem GDrive-Pfad oder aus einem bereits gesetzten
+# Paperless-Tag (von Skript 04 als NOLLM_DIRECT=true gespeichert) stammen.
+is_nollm_job() {
+    [[ "${NOLLM_DIRECT:-false}" == "true" ]] || nollm_source_path "${SOURCE_PATH:-}"
+}
+
 metadata_safe_name() {
     local v="$1"
     v="${v//$'\n'/ }"; v="${v//$'\r'/ }"
@@ -103,6 +126,29 @@ nollm_tag_document() {
         -X PATCH "$(paperless_api_url "documents/${did}/")" \
         --data "$payload" >/dev/null || return 1
     info "Paperless-Tag noLLM fuer Dokument ${did} gesetzt."
+}
+
+# Gemeinsame, unveraenderte Dateinamensbildung aus dem Gemini-Prozess.
+metadata_filename_from_approved() {
+    local did="$1" category="$2" corr_name="$3" date="$4" title="$5" source_name="$6"
+    local ext stem filename
+    local SOURCE_NAME="$source_name"
+    ext="${SOURCE_NAME##*.}"; ext="${ext,,}"
+    case "$ext" in pdf|jpg|jpeg|png) ;; *) error "Format nicht erlaubt: $ext"; return 1 ;; esac
+    category="$(metadata_safe_name "$category")"
+    corr_name="$(metadata_safe_name "$corr_name")"
+    title="$(metadata_safe_name "$title")"
+    [[ -n "$category" && -n "$corr_name" ]] || return 1
+    if [[ "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        stem="${date//-/}_${category}_${corr_name}_${title}"
+    else
+        stem="${category}_${corr_name}_${title}"
+    fi
+    # ID im Namen sorgt auch nach Trunkierung fuer stabile Eindeutigkeit.
+    local suffix="_ID-${did}" max=$((80 - ${#ext} - 1 - ${#did} - 4))
+    (( max > 0 )) || return 1
+    filename="${stem:0:max}${suffix}.${ext}"
+    printf '%s\n' "$filename"
 }
 
 metadata_process_job() {
@@ -162,23 +208,14 @@ metadata_process_job() {
     # Ein vorhandenes Paperless-created-Datum kann das Import-/Scan-Datum sein.
     date="$(jq -r '.proposal.document_date // empty' "$proposal")"
     title="$(jq -r '.title // empty' <<< "$doc")"
-    ext="${SOURCE_NAME##*.}"; ext="${ext,,}"
-    case "$ext" in pdf|jpg|jpeg|png) ;; *) error "Format nicht erlaubt: $ext"; return 1 ;; esac
+    filename="$(metadata_filename_from_approved "$did" "$category" "$corr_name" "$date" "$title" "$SOURCE_NAME")" || return 1
     category="$(metadata_safe_name "$category")"
     corr_name="$(metadata_safe_name "$corr_name")"
-    title="$(metadata_safe_name "$title")"
-    [[ -n "$category" && -n "$corr_name" ]] || return 1
-    if [[ "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-        stem="${date//-/}_${category}_${corr_name}_${title}"
-    else
-        stem="${category}_${corr_name}_${title}"
-    fi
-    # ID im Namen sorgt auch nach Trunkierung fuer stabile Eindeutigkeit.
-    local suffix="_ID-${did}" max=$((80 - ${#ext} - 1 - ${#did} - 4))
-    (( max > 0 )) || return 1
-    filename="${stem:0:max}${suffix}.${ext}"
     target="${GDRIVE_ARCHIVE%/}/${category}/${corr_name}"
     job_update "$jid" CATEGORY "$category"
+    # Der Archivzweig berechnet das Ziel aus CORRESPONDENT neu.
+    # Daher muss der freigegebene Korrespondent auch im Job stehen.
+    job_update "$jid" CORRESPONDENT "$corr_name"
     job_update "$jid" ARCHIVE_FILE "$filename"
     job_update "$jid" ARCHIVE_TARGET "$target"
     job_set_status "$jid" PAPERLESS_DONE
@@ -249,10 +286,7 @@ paperless_category_from_document() {
 
 archive_filename_from_job() {
     local source_name="$1"
-    local job_id="$2"
-
-    local stem
-    local extension
+    local stem extension safe
 
     stem="${source_name%.*}"
     extension="${source_name##*.}"
@@ -261,21 +295,15 @@ archive_filename_from_job() {
         extension=""
     fi
 
-    if [[ "${ARCHIVE_ADD_JOB_ID}" == "true" ]]; then
+    # Fallback: keine Job-UUID, ungueltige Dateinamenzeichen bereinigen.
+    safe="$(printf '%s' "${stem}" |
+        sed 's#[/:\\?*"<>|]#-#g; s/[[:cntrl:]]/-/g; s/[[:space:]]*$//')"
+    [[ -n "${safe}" ]] || safe="Dokument"
 
-        if [[ -n "${extension}" ]]; then
-            printf '%s-%s.%s\n' \
-                "${stem}" \
-                "${job_id}" \
-                "${extension}"
-        else
-            printf '%s-%s\n' \
-                "${stem}" \
-                "${job_id}"
-        fi
-
+    if [[ -n "${extension}" ]]; then
+        printf '%s.%s\n' "${safe}" "${extension}"
     else
-        printf '%s\n' "${source_name}"
+        printf '%s\n' "${safe}"
     fi
 }
 
@@ -463,6 +491,11 @@ delete_gdrive_source_and_verify() {
 delete_local_source() {
     local source_file="$1"
 
+    if is_direct_import || is_paperless_media_file "${source_file}"; then
+        error "Loeschschutz: Paperless-Direktimport oder Paperless-Mediendatei: ${source_file}"
+        return 1
+    fi
+
     if [[ ! -e "${source_file}" ]]; then
         info "Lokale Quelle ist bereits nicht vorhanden."
         return 0
@@ -502,6 +535,11 @@ delete_local_source() {
 
 cleanup_duplicate() {
     local job_id="$1"
+
+    if is_direct_import; then
+        error "Job ${job_id}: Direktimport darf nicht als GDrive-Duplikat bereinigt werden."
+        return 1
+    fi
 
     local source_file="${SOURCE_FILE:-}"
     local source_path="${SOURCE_PATH:-}"
@@ -760,6 +798,20 @@ while IFS= read -r job_file; do
     # noLLM wartet auf explizite Freigabe in der Quarantaene-Weboberflaeche.
     # Es darf niemals in den Gemini-Verarbeitungspfad fallen.
     if [[ "$status" == "GEMINI_SKIPPED" ]]; then
+        # Auch Direktimporte mit noLLM bleiben bis zur manuellen Freigabe liegen.
+        continue
+    fi
+
+    # Die Quarantaene-Oberflaeche kann noLLM-Jobs mit REVIEW_APPROVED
+    # freigeben. Diese duerfen niemals metadata_process_job/Gemini aufrufen.
+    if [[ "$status" == "REVIEW_APPROVED" ]] && is_nollm_job; then
+        if [[ "${NOLLM_APPROVED:-false}" != "true" ]]; then
+            error "Job ${job_id}: noLLM-Freigabe fehlt; REVIEW_APPROVED wird nicht archiviert."
+            continue
+        fi
+        job_set_status "$job_id" PAPERLESS_DONE
+        info "Job ${job_id}: noLLM manuell freigegeben; bereit zur Archivierung."
+        processed=$((processed + 1))
         continue
     fi
 
@@ -852,12 +904,17 @@ while IFS= read -r job_file; do
             continue
         fi
 
+        if is_direct_import && ! is_paperless_media_file "$source_file"; then
+            error "Job ${job_id}: Direktimport-SOURCE_FILE liegt nicht im Paperless-Medienbereich."
+            continue
+        fi
+
         if [[ -z "${source_name}" ]]; then
             error "Job ${job_id}: SOURCE_NAME ist leer."
             continue
         fi
 
-        if [[ -z "${source_path}" ]]; then
+        if [[ -z "${source_path}" ]] && ! is_direct_import; then
             error "Job ${job_id}: SOURCE_PATH ist leer."
 
             job_update \
@@ -885,6 +942,19 @@ while IFS= read -r job_file; do
 
         archive_file="${ARCHIVE_FILE:-}"
 
+        # noLLM: Nur nach bestaetigter Freigabe; exakt derselbe Builder wie Gemini.
+        if is_nollm_job && [[ "${NOLLM_APPROVED:-false}" != "true" ]]; then
+            error "Job ${job_id}: noLLM ohne Freigabe, Archivierung gesperrt."
+            continue
+        fi
+        if is_nollm_job && [[ -z "${archive_file}" ]]; then
+            doc="$(paperless_document_json "$document_id")" || continue
+            title="$(jq -r '.title // empty' <<< "$doc")"
+            approved_date="${NOLLM_DOCUMENT_DATE:-}"
+            archive_file="$(metadata_filename_from_approved "$document_id" "$category" "${CORRESPONDENT:-SONSTIGES}" "$approved_date" "$title" "$source_name")" || continue
+            job_update "$job_id" ARCHIVE_FILE "$archive_file"
+        fi
+
         if [[ -z "${archive_file}" ]]; then
             archive_file="$(
                 archive_filename_from_job \
@@ -904,16 +974,21 @@ while IFS= read -r job_file; do
         # ----------------------------------------------------
         # Archivziel
         # ----------------------------------------------------
-
         archive_target="${ARCHIVE_TARGET:-}"
+        correspondent="${CORRESPONDENT:-SONSTIGES}"
+        [[ -n "${correspondent}" ]] || correspondent="SONSTIGES"
 
-        if [[ -z "${archive_target}" ]]; then
-            if [[ "${NOLLM_APPROVED:-false}" == "true" && -n "${CORRESPONDENT:-}" ]]; then
-                archive_target="${GDRIVE_ARCHIVE%/}/${category}/${CORRESPONDENT}"
-            else
-                archive_target="$(archive_target_from_category "${category}")"
-            fi
+        # Pfadbestandteile duerfen keine Unterverzeichnisse erzeugen.
+        correspondent="$(printf '%s' "${correspondent}" |
+            sed 's#[/:\\?*"<>|]#-#g; s/[[:cntrl:]]/-/g')"
+        [[ -n "${correspondent}" ]] || correspondent="SONSTIGES"
 
+        # Ziel aus den aktuellen Job-Metadaten ableiten.
+        # Ein altes oder abweichendes Ziel darf nicht weiterverwendet werden.
+        expected_target="${GDRIVE_ARCHIVE%/}/${category}/${correspondent}"
+
+        if [[ "${archive_target}" != "${expected_target}" ]]; then
+            archive_target="${expected_target}"
             job_update \
                 "${job_id}" \
                 "ARCHIVE_TARGET" \
@@ -931,6 +1006,16 @@ while IFS= read -r job_file; do
 
         if [[ "${archive_verified}" == "true" ]]; then
             info "Archiv ist bereits verifiziert."
+
+            # Ein Direktimport ist keine zu loeschende Scanpool-/GDrive-Quelle.
+            # Ein Paperless-Original ist auch bei falsch markiertem Job geschuetzt.
+            if is_direct_import || is_paperless_media_file "$source_file"; then
+                info "Job ${job_id}: Paperless-Original und GDrive-Quelle bleiben unangetastet."
+                job_update "$job_id" COMPLETED_AT "$(iso_now)"
+                job_set_status "$job_id" COMPLETE
+                processed=$((processed + 1))
+                continue
+            fi
 
             # ------------------------------------------------
             # Google-Drive-Quelle
@@ -1107,6 +1192,11 @@ while IFS= read -r job_file; do
     # ========================================================
     # Paperless Task überwachen
     # ========================================================
+
+    if is_direct_import; then
+        error "Job ${job_id}: Direktimport mit unerwartetem Task-Status ${status}; keine Task-Abfrage."
+        continue
+    fi
 
     task_id="${PAPERLESS_TASK_ID:-}"
 

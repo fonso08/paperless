@@ -60,21 +60,38 @@ if ! all_ids="$(pm_paperless_all_ids)"; then
 fi
 
 skipped_no_llm=0
+skipped_existing=0
+checked_missing=0
 
 candidates=()
+
 while IFS= read -r id; do
     [[ "$id" =~ ^[0-9]+$ ]] || continue
 
+    proposal_file="$PROPOSALS/$id.json"
+
+    # 1. Zuerst lokal prüfen – kein API-Aufruf erforderlich.
+    if [[ -f "$proposal_file" ]] &&
+       jq -e . "$proposal_file" >/dev/null 2>&1; then
+        ((skipped_existing+=1))
+        continue
+    fi
+
+    ((checked_missing+=1))
+
+    # 2. Nur Dokumente ohne gültiges Proposal über die API prüfen.
     if ! document_json="$(pm_paperless_document "$id")"; then
         echo "[FEHLER] Dokument $id konnte nicht geprüft werden; Abbruch." >&2
         exit 1
     fi
 
-    if ! jq -e '.tags | type == "array"' <<< "$document_json" >/dev/null 2>&1; then
-        echo "[FEHLER] Tags von Dokument $id sind nicht lesbar; Abbruch." >&2
+    if ! jq -e '.tags | type == "array"' \
+        <<< "$document_json" >/dev/null 2>&1; then
+        echo "[FEHLER] Tags von Dokument $id nicht lesbar; Abbruch." >&2
         exit 1
     fi
 
+    # 3. noLLM weiterhin konsequent ausschließen.
     if jq -e --argjson tag_id "$NO_LLM_TAG_ID" \
         '(.tags | index($tag_id)) != null' \
         <<< "$document_json" >/dev/null; then
@@ -82,18 +99,24 @@ while IFS= read -r id; do
         continue
     fi
 
-    proposal_file="$PROPOSALS/$id.json"
-    if [[ -f "$proposal_file" ]] && jq -e . "$proposal_file" >/dev/null 2>&1; then
-        continue
-    fi
-
+    # 4. Geeigneten Kandidaten aufnehmen.
     candidates+=("$id")
+
+    echo "[AUSWAHL] ${#candidates[@]}/$LIMIT: Dokument $id"
+
+    # 5. Sofort stoppen, sobald das Limit erreicht ist.
     if (( LIMIT > 0 && ${#candidates[@]} >= LIMIT )); then
         break
     fi
+
 done <<< "$all_ids"
 
 total=${#candidates[@]}
+
+echo "[INFO] Vorhandene Proposals übersprungen: $skipped_existing"
+echo "[INFO] Fehlende Proposals geprüft: $checked_missing"
+echo "[INFO] Wegen noLLM ausgeschlossen: $skipped_no_llm"
+echo "[INFO] Für Gemini ausgewählt: $total"
 analyzed=0
 applied=0
 skipped=0

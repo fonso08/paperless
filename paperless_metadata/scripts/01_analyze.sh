@@ -72,21 +72,36 @@ if [[ "$mode" == id ]]; then
 else
   all_ids="$(pm_paperless_all_ids)"
   if [[ "$mode" == missing ]]; then
-    ids=""
-    selected=0
-    while IFS= read -r candidate; do
-      [[ "$candidate" =~ ^[0-9]+$ ]] || continue
-      proposal_file="$PM_STATE/proposals/${candidate}.json"
-      if [[ -f "$proposal_file" ]] &&
-         jq -e . "$proposal_file" >/dev/null 2>&1; then
-        continue
-      fi
-      if [[ -n "$ids" ]]; then ids+=$'\n'; fi
-      ids+="$candidate"
-      ((selected+=1))
-      if (( selected >= value )); then break; fi
-    done <<< "$all_ids"
-    pm_log INFO "Fehlende Vorschläge ausgewählt: $selected"
+  ids=""
+  selected=0
+
+  while IFS= read -r candidate; do
+    [[ "$candidate" =~ ^[0-9]+$ ]] || continue
+
+    proposal_file="$PM_STATE/proposals/${candidate}.json"
+
+    # Bereits analysierte Dokumente überspringen.
+    if [[ -f "$proposal_file" ]] &&
+      jq -e --argjson id "$candidate" '
+        .document_id == $id
+        and (.proposal | type == "object")
+      ' "$proposal_file" >/dev/null 2>&1; then
+      continue
+    fi
+
+    if [[ -n "$ids" ]]; then
+      ids+=$'\n'
+    fi
+
+    ids+="$candidate"
+    ((selected+=1))
+
+    if (( selected >= value )); then
+      break
+    fi
+  done <<< "$all_ids"
+
+  pm_log INFO "Fehlende Vorschläge ohne noLLM ausgewählt: $selected"
   else
     ids="$(printf '%s\n' "$all_ids" | sed -n "1,${value}p")"
   fi
@@ -121,12 +136,57 @@ if ! jq -e '.tags | type == "array"' \
   continue
 fi
 
-# Dokumente mit noLLM grundsätzlich nicht an Gemini senden.
+# noLLM: niemals Gemini aufrufen; fehlendes Proposal fuer
+# manuelle Bearbeitung erzeugen.
 if [[ -n "$NO_LLM_TAG_ID" ]] && jq -e --argjson tag_id "$NO_LLM_TAG_ID" \
     '(.tags | index($tag_id)) != null' \
     "$document_file" >/dev/null; then
+
+  target_proposal="$PM_STATE/proposals/${id}.json"
+
+  if [[ -f "$target_proposal" ]] &&
+     jq -e . "$target_proposal" >/dev/null 2>&1; then
+    pm_log INFO "Dokument $id: vorhandenes Proposal bleibt unveraendert"
+  else
+    jq -n \
+      --slurpfile document "$document_file" \
+      --arg generated "$(date -Is)" \
+      '($document[0]) as $document
+       | {
+          document_id: $document.id,
+          existing: {
+            title: $document.title,
+            created: $document.created,
+            original_file_name: $document.original_file_name,
+            archived_file_name: $document.archived_file_name,
+            correspondent: $document.correspondent,
+            tags: $document.tags,
+            document_type: $document.document_type
+          },
+          analysis: {
+            ocr_char_count: (($document.content // "") | length),
+            ocr_sent_char_count: 0
+          },
+          proposal: {
+            requires_review: true,
+            review_decision: "manual_check",
+            validation_warnings: [
+              "Tag noLLM: keine Gemini-Analyse; manuelle Bearbeitung erforderlich"
+            ],
+            reason: "Manuelle Bearbeitung erforderlich: Dokument ist mit noLLM markiert."
+          },
+          provider: "none",
+          model: "manual-noLLM",
+          generated_at: $generated,
+          applied: false
+        }' |
+      pm_atomic_json "$target_proposal"
+
+    pm_log INFO "Dokument $id: manuelles noLLM-Placeholder-Proposal gespeichert"
+  fi
+
   rm -f "$document_file" "$request_file" "$proposal_file"
-  pm_log INFO "Dokument $id wegen Tag noLLM übersprungen"
+  ((processed+=1))
   continue
 fi
 

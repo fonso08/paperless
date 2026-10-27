@@ -146,7 +146,8 @@ def read_job(path):
     data = {}
     wanted = {
         'STATUS', 'PAPERLESS_DOCUMENT_ID', 'JOB_ID', 'SOURCE_PATH',
-        'SOURCE_NAME', 'CATEGORY', 'CORRESPONDENT', 'NOLLM_APPROVED'
+        'SOURCE_NAME', 'CATEGORY', 'CORRESPONDENT', 'NOLLM_APPROVED',
+        'IMPORT_SOURCE', 'NOLLM_DIRECT'
     }
     for line in path.read_text(encoding='utf-8').splitlines():
         if '=' in line:
@@ -159,6 +160,14 @@ def read_job(path):
 def is_nollm_source(path_value):
     # SOURCE_PATH is relative to gdrive:SCAN. Match a complete path segment only.
     return 'noLLM' in Path(path_value.replace('\\', '/')).parts
+
+
+def is_nollm_job(data):
+    # GDrive: noLLM als eigener Quellpfad-Bestandteil.
+    # Direktimport: noLLM-Tag wurde bei Job-Erzeugung als Flag erfasst.
+    return (is_nollm_source(data.get('SOURCE_PATH', ''))
+            or (data.get('IMPORT_SOURCE') == 'PAPERLESS_DIRECT'
+                and data.get('NOLLM_DIRECT') == 'true'))
 
 
 def job_for_doc(doc_id):
@@ -177,10 +186,30 @@ def job_for_nollm_doc(doc_id):
         data = read_job(path)
         if (data.get('PAPERLESS_DOCUMENT_ID') == str(doc_id)
                 and data.get('STATUS') == 'GEMINI_SKIPPED'
-                and is_nollm_source(data.get('SOURCE_PATH', ''))):
+                and is_nollm_job(data)):
             return path
     return None
 
+def nollm_proposal_for_doc(doc_id):
+    path = PROPOSALS / f'{doc_id}.json'
+    if not path.is_file():
+        return False
+
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (ValueError, OSError):
+        return False
+
+    proposal = data.get('proposal', {})
+    warnings = proposal.get('validation_warnings', [])
+
+    return (
+        data.get('document_id') == doc_id
+        and data.get('provider') == 'none'
+        and data.get('model') == 'manual-noLLM'
+        and any('noLLM' in str(warning) for warning in warnings)
+        and data.get('applied') is False
+    )
 
 def update_job_fields(path, fields):
     """Atomically update selected shell assignments without dropping other job data."""
@@ -384,12 +413,26 @@ def index():
     rows = []
     nollm_rows = []
 
+    # noLLM-Proposals ohne zugehörigen Job ebenfalls zur Prüfung anzeigen.
+    for proposal_path in PROPOSALS.glob('*.json'):
+        try:
+            did = int(proposal_path.stem)
+        except ValueError:
+            continue
+
+        if nollm_proposal_for_doc(did):
+            if job_for_nollm_doc(did) is None:
+                nollm_rows.append({
+                    'id': str(did),
+                    'source': 'Direkt in Paperless – kein Job vorhanden'
+                })
+
     for job in JOBS.glob('*/job.conf'):
         info = read_job(job)
         did = info.get('PAPERLESS_DOCUMENT_ID', '')
         if not did.isdigit():
             continue
-        if info.get('STATUS') == 'GEMINI_SKIPPED' and is_nollm_source(info.get('SOURCE_PATH', '')):
+        if info.get('STATUS') == 'GEMINI_SKIPPED' and is_nollm_job(info):
             nollm_rows.append({'id': did, 'source': info.get('SOURCE_PATH', '')})
             continue
         if info.get('STATUS') != 'QUARANTINE':
@@ -412,8 +455,14 @@ def index():
       <article>
         <strong>noLLM – Dokument {{r.id}}</strong>
         <p><small>{{r.source}}</small></p>
-        <a class="button" href="{{url_for('review_nollm', did=r.id)}}">Metadaten auswählen und freigeben</a>
-      </article>
+        <a class="button" href="{{url_for('review_nollm', did=r.id)}}">
+          {% if 'kein Job vorhanden' in r.source %}
+            Paperless-Metadaten bearbeiten
+          {% else %}
+            Metadaten auswählen und freigeben
+          {% endif %}
+        </a>
+</article>
     {% endfor %}
     {% for r in rows %}
       <article>
@@ -428,7 +477,8 @@ def index():
 @require_login
 def review_nollm(did):
     job = job_for_nollm_doc(did)
-    if not job:
+    direct_nollm = job is None and nollm_proposal_for_doc(did)
+    if job is None and not direct_nollm:
         abort(404)
     error = ''
     result = ''
@@ -447,9 +497,12 @@ def review_nollm(did):
         if shared_lock is None:
             return page("""<p class=\"status-error\">Die Archivierung läuft gerade. Bitte erneut versuchen.</p><p><a href=\"{{url_for('review_nollm', did=did)}}\">Zurück</a></p>""", did=did), 409
         try:
-            current = read_job(job)
-            if current.get('STATUS') != 'GEMINI_SKIPPED' or not is_nollm_source(current.get('SOURCE_PATH', '')):
-                abort(409, 'Der Job ist kein freizugebender noLLM-Job mehr.')
+            if job is not None:
+                current = read_job(job)
+                if current.get('STATUS') != 'GEMINI_SKIPPED' or not is_nollm_job(current):
+                    abort(409, 'Der Job ist kein freizugebender noLLM-Job mehr.')
+            elif not nollm_proposal_for_doc(did):
+                abort(409, 'Das manuelle noLLM-Proposal ist nicht mehr freigegeben zur Bearbeitung.')
 
             title = request.form.get('title', '').strip()
             category_id = request.form.get('category', '').strip()
@@ -526,17 +579,48 @@ def review_nollm(did):
                 json=update_payload, timeout=45
             )
             response.raise_for_status()
-
             correspondent_name = safe_archive_component(corr_name)
-            # Release only after Paperless metadata update succeeds.
-            update_job_fields(job, {
-                'CATEGORY': category_name,
-                'CORRESPONDENT': correspondent_name,
-                'NOLLM_APPROVED': 'true',
-                'NOLLM_APPROVED_AT': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                'STATUS': 'PAPERLESS_DONE'
-            })
+            approved_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+            if job is not None:
+                # Bestehender Ablauf für reguläre noLLM-Jobs bleibt unverändert.
+                update_job_fields(job, {
+                    'CATEGORY': category_name,
+                    'CORRESPONDENT': correspondent_name,
+                    'NOLLM_APPROVED': 'true',
+                    'NOLLM_DOCUMENT_DATE': date_value if approve_date else '',
+                    'NOLLM_APPROVED_AT': approved_at,
+                    'STATUS': 'PAPERLESS_DONE'
+                })
+            else:
+                # Direkt importiertes Paperless-Dokument: kein Archivierungsjob.
+                proposal_path = PROPOSALS / f'{did}.json'
+                proposal_data = json.loads(
+                    proposal_path.read_text(encoding='utf-8')
+                )
+                proposal = proposal_data.setdefault('proposal', {})
+
+                proposal.update({
+                    'title': title,
+                    'primary_tag': tag_by_id[category_id]['name'],
+                    'correspondent_suggestion': corr_name,
+                    'document_date': date_value if approve_date else '',
+                    'requires_review': False,
+                    'review_decision': 'manual_approved',
+                    'validation_warnings': []
+                })
+
+                proposal_data['manual_review'] = {
+                    'approved_at': approved_at,
+                    'category': tag_by_id[category_id]['name'],
+                    'correspondent': corr_name,
+                    'date_approved': bool(approve_date)
+                }
+                proposal_data['applied'] = True
+                save_json(proposal_path, proposal_data)
+
             return redirect(url_for('index'))
+
         except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
             error = f'Freigabe nicht abgeschlossen. Der Job bleibt in noLLM-Quarantäne. Details: {exc}'
         finally:
@@ -652,11 +736,14 @@ def review(did):
                 erneut versuchen.</p>
                 <p><a href="{{url_for('review', did=did)}}">Zurück</a></p>
                 ''', did=did), 409
-
             try:
                 current_job = read_job(job)
-                if current_job.get('STATUS') != 'QUARANTINE':
-                    abort(409, 'Job ist nicht mehr in Quarantäne.')
+
+                if (
+                    current_job.get('STATUS') != 'GEMINI_SKIPPED'
+                    or not is_nollm_job(current_job)
+                ):
+                    abort(409, 'Job ist kein freizugebender noLLM-Job mehr.')
 
                 data['proposal'] = prop
                 data['applied'] = False
@@ -676,6 +763,15 @@ def review(did):
                     original,
                     count=1
                 )
+                if re.search(r'(?m)^NOLLM_APPROVED=', updated):
+                    updated = re.sub(
+                        r'(?m)^NOLLM_APPROVED=.*$',
+                        'NOLLM_APPROVED=true',
+                        updated,
+                        count=1
+                    )
+                else:
+                    updated += '\nNOLLM_APPROVED=true\n'
                 if updated == original:
                     abort(500)
 
@@ -1042,7 +1138,9 @@ def reapply():
 @app.route('/preview/<int:did>')
 @require_login
 def preview(did):
-    if not job_for_doc(did) and not job_for_nollm_doc(did):
+    if (not job_for_doc(did)
+            and not job_for_nollm_doc(did)
+            and not nollm_proposal_for_doc(did)):
         abort(404)
 
     response = requests.get(

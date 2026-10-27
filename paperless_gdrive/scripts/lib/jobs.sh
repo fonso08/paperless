@@ -366,6 +366,31 @@ job_find_by_source_path() {
     return 1
 }
 
+job_find_by_document_id() {
+    local document_id="$1"
+    local file
+
+    [[ "$document_id" =~ ^[0-9]+$ ]] || return 1
+
+    while IFS= read -r -d '' file; do
+        (
+            unset PAPERLESS_DOCUMENT_ID JOB_ID
+            source "$file"
+
+            if [[ "${PAPERLESS_DOCUMENT_ID:-}" == "$document_id" ]]; then
+                printf '%s\n' "${JOB_ID:-$(basename "$(dirname "$file")")}"
+                exit 0
+            fi
+
+            exit 1
+        ) && return 0
+    done < <(
+        find "$JOB_DIR" -mindepth 2 -maxdepth 2 \
+            -type f -name job.conf -print0
+    )
+
+    return 1
+}
 
 # ------------------------------------------------------------
 # Job anhand des Dateinamens suchen
