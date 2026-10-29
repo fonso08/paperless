@@ -21,7 +21,7 @@ while true; do
     echo "===== Durchlauf $ROUND ====="
 
     # Ausgabe live anzeigen und gleichzeitig zur Auswertung speichern.
-    ./scripts/01_analyze.sh --missing "$BATCH_SIZE" 2>&1 | tee "$LOG_FILE"
+    ./scripts/01_analyze_doc.sh --missing "$BATCH_SIZE" 2>&1 | tee "$LOG_FILE"
     STATUS=${PIPESTATUS[0]}
 
     if (( STATUS != 0 )); then
@@ -32,9 +32,9 @@ while true; do
     fi
 
     SELECTED="$(
-        sed -n \
-          's/.*Fehlende Vorschläge ausgewählt: \([0-9][0-9]*\).*/\1/p' \
-          "$LOG_FILE" | tail -n 1
+    sed -n \
+      's/.*Fehlende Vorschläge\( ohne noLLM\)\? ausgewählt: \([0-9][0-9]*\).*/\2/p' \
+      "$LOG_FILE" | tail -n 1
     )"
 
     if [[ ! "$SELECTED" =~ ^[0-9]+$ ]]; then

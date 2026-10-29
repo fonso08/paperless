@@ -140,7 +140,7 @@ for id in "${candidates[@]}"; do
         continue
     fi
 
-    if ! "$SCRIPT_DIR/01_analyze.sh" --id "$id"; then
+    if ! "$SCRIPT_DIR/01_analyze_doc.sh" --id "$id"; then
         echo "[FEHLER] Analyse für Dokument $id fehlgeschlagen." >&2
         ((failed+=1))
         continue
@@ -162,7 +162,7 @@ for id in "${candidates[@]}"; do
         apply_args+=(--apply)
     fi
 
-    if "$SCRIPT_DIR/03_apply_proposals.sh" "${apply_args[@]}"; then
+    if "$SCRIPT_DIR/02_apply_proposals.sh" "${apply_args[@]}"; then
         if [[ "$DRY_RUN" != true ]] &&
            jq -e '.applied == true' "$proposal_file" >/dev/null 2>&1; then
             ((applied+=1))

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# 01_gdrive_scan_to_pool.sh
+# i01_submit_scanpool.sh
 # ============================================================
 # Google Drive SCAN -> lokaler Scanpool
 #

@@ -6,16 +6,22 @@ set -euo pipefail
 source "$(dirname "$0")/lib/paperless_api.sh"
 pm_init
 
-MODE="dry-run"
+MODE="apply"
 ONLY_ID=""
 LIMIT=0
 
+
 while (($#)); do
   case "$1" in
-    --apply) MODE="apply" ;;
+    --apply)
+      MODE="apply"
+      ;;
+    --dry-run)
+      MODE="dry-run"
+      ;;
     --id)
       [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || {
-        echo "Aufruf: $0 [--id NUMMER] [--limit ANZAHL] [--apply]" >&2
+        echo "Aufruf: $0 [--id NUMMER] [--limit ANZAHL] [--dry-run|--apply]" >&2
         exit 2
       }
       ONLY_ID="$2"
@@ -30,7 +36,7 @@ while (($#)); do
       shift
       ;;
     *)
-      echo "Aufruf: $0 [--id NUMMER] [--limit ANZAHL] [--apply]" >&2
+      echo "Aufruf: $0 [--id NUMMER] [--limit ANZAHL] [--dry-run|--apply]" >&2
       exit 2
       ;;
   esac
@@ -42,8 +48,77 @@ done
 
 PROPOSALS="$PM_STATE/proposals"
 BACKUPS="$PM_STATE/applied_backups"
+APPLY_INDEX="$PM_STATE/apply_candidates.json"
+
 mkdir -p "$BACKUPS"
 
+# Index einmalig aufbauen, wenn er fehlt oder ungültig ist.
+# Danach wird bei normalen Läufen nur noch der Index gelesen.
+rebuild_apply_index() {
+  local file
+  local ids_tmp
+
+  ids_tmp="$(mktemp "${TMPDIR:-/tmp}/pm-apply-ids.XXXXXX")"
+
+  shopt -s nullglob
+  for file in "$PROPOSALS"/*.json; do
+    jq -e '
+      .applied != true and
+      (.document_id | numbers) and
+      (.proposal | type == "object") and
+      (.model != "manual-noLLM") and
+      (.provider != "none") and
+      ((.proposal.primary_tag // "") | type == "string" and length > 0)
+    ' "$file" >/dev/null 2>&1 || continue
+
+    jq -r '.document_id' "$file" >> "$ids_tmp"
+  done
+  shopt -u nullglob
+
+  jq -Rsc '
+    split("\\n")
+    | map(select(test("^[0-9]+$")) | tonumber)
+    | unique
+  ' "$ids_tmp" | pm_atomic_json "$APPLY_INDEX"
+
+  rm -f "$ids_tmp"
+
+  echo "[INFO] Apply-Index neu aufgebaut: $(jq 'length' "$APPLY_INDEX") IDs"
+}
+
+if [[ ! -f "$APPLY_INDEX" ]] ||
+   ! jq -e '
+     type == "array" and
+     all(.[]; type == "number" and floor == . and . > 0)
+   ' "$APPLY_INDEX" >/dev/null 2>&1; then
+  rebuild_apply_index
+fi
+
+# Einzelne ID nach erfolgreicher Anwendung aus dem Index entfernen.
+remove_apply_candidate() {
+  local id="$1"
+  local tmp
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/pm-apply-index.XXXXXX")"
+
+  if ! jq --argjson id "$id" \
+    '[.[] | select(. != $id)]' "$APPLY_INDEX" > "$tmp"; then
+    rm -f "$tmp"
+    echo "[FEHLER] Apply-Index konnte nicht aktualisiert werden." >&2
+    return 1
+  fi
+
+  if ! jq -e '
+    type == "array" and
+    all(.[]; type == "number" and floor == . and . > 0)
+  ' "$tmp" >/dev/null; then
+    rm -f "$tmp"
+    echo "[FEHLER] Neuer Apply-Index ist ungültig." >&2
+    return 1
+  fi
+
+  mv "$tmp" "$APPLY_INDEX"
+}
 api_write() {
   local method="$1" endpoint="$2" payload="$3" response code
   response="$(mktemp)"
@@ -113,31 +188,43 @@ count_review=0
 count_failed=0
 
 shopt -s nullglob
-shopt -s nullglob
+
+files=()
 
 if [[ -n "$ONLY_ID" ]]; then
-  files=("$PROPOSALS/$ONLY_ID.json")
-  [[ -f "${files[0]}" ]] || {
-    echo "Proposal für Dokument $ONLY_ID nicht gefunden." >&2
+  file="$PROPOSALS/$ONLY_ID.json"
+
+  [[ -f "$file" ]] || {
+    echo "Proposal nicht gefunden: $file" >&2
     exit 1
   }
+
+  files+=("$file")
 else
-  files=()
-  for candidate in "$PROPOSALS"/*.json; do
-    jq -e '
+  while IFS= read -r id; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+
+    candidate="$PROPOSALS/$id.json"
+    [[ -f "$candidate" ]] || continue
+
+    # Die Index-ID muss zum Dokument in der Datei passen.
+    jq -e --argjson id "$id" '
+      .document_id == $id and
       .applied != true and
-      .proposal.requires_review == false and
-      .proposal.review_decision == "no_check_needed" and
-      (.proposal.confidence | type == "number" and . >= 0.85) and
-      ((.proposal.validation_warnings // []) | length == 0)
+      (.proposal | type == "object") and
+      (.model != "manual-noLLM") and
+      (.provider != "none") and
+      ((.proposal.primary_tag // "") | type == "string" and length > 0)
     ' "$candidate" >/dev/null 2>&1 || continue
 
     files+=("$candidate")
+
     if (( LIMIT > 0 && ${#files[@]} >= LIMIT )); then
       break
     fi
-  done
+  done < <(jq -r '.[]' "$APPLY_INDEX")
 fi
+
 
 total=${#files[@]}
 seen=0
@@ -156,32 +243,8 @@ for file in "${files[@]}"; do
     continue
   fi
 
-  if [[ "$(jq -r '.proposal.requires_review == true' "$file")" != "false" ]]; then
-    ((count_review+=1))
-    continue
-  fi
-
   id="$(jq -r '.document_id' "$file")"
   [[ -z "$ONLY_ID" || "$id" == "$ONLY_ID" ]] || continue
-
-  decision="$(jq -r '.proposal.review_decision // "unset"' "$file")"
-  if [[ "$decision" != "no_check_needed" ]]; then
-    echo "[SKIP] Dokument $id: review_decision=$decision"
-    ((count_review+=1))
-    continue
-  fi
-
-  if ! jq -e '(.proposal.confidence | type == "number" and . >= 0.85)' "$file" >/dev/null 2>&1; then
-    echo "[SKIP] Dokument $id: Konfidenz fehlt oder liegt unter 0.85"
-    ((count_review+=1))
-    continue
-  fi
-  warnings="$(jq -r '(.proposal.validation_warnings // []) | length' "$file")"
-  if [[ "$warnings" != "0" ]]; then
-    echo "[SKIP] Dokument $id: Validierungswarnungen vorhanden"
-    ((count_review+=1))
-    continue
-  fi
 
   primary="$(jq -r '.proposal.primary_tag // empty' "$file")"
   date="$(jq -r '.proposal.document_date // empty' "$file")"
@@ -237,18 +300,14 @@ for file in "${files[@]}"; do
     # Eine ausdrueckliche Review-Freigabe darf auch einen bereits gesetzten
     # Korrespondenten korrigieren. Ohne manuelle Freigabe bleibt das alte
     # konservative Verhalten erhalten.
-    if [[ -n "$current_corr" && -z "$manual_approved" ]]; then
-      corr_id="$current_corr"
-    else
       corr_id="$(ensure_resource correspondents "$correspondent")" || {
-        echo "[FEHLER] Dokument $id: Korrespondent nicht verfügbar" >&2
-        ((count_failed+=1))
-        continue
-      }
-      if [[ "$corr_id" == WOULD_CREATE:* ]]; then
-        echo "[DRY-RUN] Dokument $id: Korrespondent anlegen: $correspondent"
-        corr_id=""
-      fi
+      echo "[FEHLER] Dokument $id: Korrespondent nicht verfügbar" >&2
+      ((count_failed+=1))
+      continue
+    }
+    if [[ "$corr_id" == WOULD_CREATE:* ]]; then
+      echo "[DRY-RUN] Dokument $id: Korrespondent anlegen: $correspondent"
+      corr_id=""
     fi
   fi
 
@@ -327,10 +386,33 @@ for file in "${files[@]}"; do
       continue
     fi
 
-    tmp="$(mktemp)"
-    jq '.applied = true | .applied_at = (now | todate)' "$file" > "$tmp"
-    mv "$tmp" "$file"
-    echo "[OK] Dokument $id: Vorschlag übernommen"
+tmp="$(mktemp)"
+
+if ! jq '.applied = true | .applied_at = (now | todate)' \
+  "$file" > "$tmp"; then
+  rm -f "$tmp"
+  echo "[FEHLER] Dokument $id: Proposal konnte nicht aktualisiert werden." >&2
+  ((count_failed+=1))
+  continue
+fi
+
+if ! mv "$tmp" "$file"; then
+  rm -f "$tmp"
+  echo "[FEHLER] Dokument $id: Proposal konnte nicht gespeichert werden." >&2
+  ((count_failed+=1))
+  continue
+fi
+
+if [[ "$MODE" == "apply" ]] && [[ -z "$ONLY_ID" ]]; then
+  if ! remove_apply_candidate "$id"; then
+    echo "[FEHLER] Dokument $id: Übernahme bestätigt, Indexbereinigung fehlgeschlagen." >&2
+    ((count_failed+=1))
+    continue
+  fi
+fi
+
+echo "[OK] Dokument $id: Vorschlag übernommen"
+
   else
     echo "[DRY-RUN] Dokument $id: Hauptkategorie=$primary; Datum=${date:-unverändert}; Korrespondent=${correspondent:-unverändert}"
     echo "[DRY-RUN] Dokument $id: zusätzliche Tags werden ergänzt; vorhandene Tags bleiben erhalten"

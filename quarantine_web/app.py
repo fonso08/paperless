@@ -740,10 +740,13 @@ def review(did):
                 current_job = read_job(job)
 
                 if (
-                    current_job.get('STATUS') != 'GEMINI_SKIPPED'
-                    or not is_nollm_job(current_job)
+                    current_job.get('STATUS') != 'QUARANTINE'
+                    or is_nollm_job(current_job)
                 ):
-                    abort(409, 'Job ist kein freizugebender noLLM-Job mehr.')
+                    abort(
+                        409,
+                        'Job ist kein freizugebender Gemini-Quarantäne-Job mehr.'
+                    )
 
                 data['proposal'] = prop
                 data['applied'] = False
@@ -763,15 +766,6 @@ def review(did):
                     original,
                     count=1
                 )
-                if re.search(r'(?m)^NOLLM_APPROVED=', updated):
-                    updated = re.sub(
-                        r'(?m)^NOLLM_APPROVED=.*$',
-                        'NOLLM_APPROVED=true',
-                        updated,
-                        count=1
-                    )
-                else:
-                    updated += '\nNOLLM_APPROVED=true\n'
                 if updated == original:
                     abort(500)
 

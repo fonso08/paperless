@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Read-only: OCR-Inhalte und Metadaten lesen; Vorschläge über Gemini erzeugen.
 # Speichert zusätzlich die OCR-Textlänge.
-# Aufruf: ./scripts/01_analyze.sh [--id NUMMER | --limit ANZAHL]
+# Aufruf: ./scripts/01_analyze_doc.sh [--id NUMMER | --limit ANZAHL]
 
 set -euo pipefail
 
@@ -13,7 +13,7 @@ value=10
 
 if (( $# > 0 )); then
   if (( $# != 2 )); then
-    echo 'Aufruf: 01_analyze.sh [--id NUMMER | --limit ANZAHL | --missing ANZAHL]' >&2
+    echo 'Aufruf: 01_analyze_doc.sh [--id NUMMER | --limit ANZAHL | --missing ANZAHL]' >&2
     exit 2
   fi
 
@@ -70,60 +70,38 @@ fi
 if [[ "$mode" == id ]]; then
   ids="$value"
 else
-  all_ids="$(pm_paperless_all_ids)"
-  if [[ "$mode" == missing ]]; then
-  ids=""
-  selected=0
-
-  while IFS= read -r candidate; do
-    [[ "$candidate" =~ ^[0-9]+$ ]] || continue
-
-    proposal_file="$PM_STATE/proposals/${candidate}.json"
-
-    # Bereits analysierte Dokumente überspringen.
-    if [[ -f "$proposal_file" ]] &&
-       jq -e . "$proposal_file" >/dev/null 2>&1; then
-      continue
-    fi
-
-    # noLLM-Dokumente bereits bei der Auswahl ausschließen.
-    if [[ -n "$NO_LLM_TAG_ID" ]]; then
-      if ! candidate_doc="$(pm_paperless_document "$candidate")"; then
-        pm_log WARN "Dokument $candidate nicht lesbar; übersprungen"
-        continue
-      fi
-
-      if jq -e --argjson tag_id "$NO_LLM_TAG_ID" \
-        '(.tags | type == "array") and
-         ((.tags | index($tag_id)) != null)' \
-        >/dev/null <<< "$candidate_doc"; then
-        continue
-      fi
-    fi
-
-    if [[ -n "$ids" ]]; then
-      ids+=$'\n'
-    fi
-
-    ids+="$candidate"
-    ((selected+=1))
-
-    if (( selected >= value )); then
-      break
-    fi
-  done <<< "$all_ids"
-
-  pm_log INFO "Fehlende Vorschläge ohne noLLM ausgewählt: $selected"
-  else
-    ids="$(printf '%s\n' "$all_ids" | sed -n "1,${value}p")"
-  fi
+  # Alle Dokument-IDs bereitstellen.
+  # Die Begrenzung erfolgt später anhand der Gemini-Anfragen.
+  ids="$(pm_paperless_all_ids)"
 fi
 
 processed=0
 failed=0
+gemini_requests=0
 
 while IFS= read -r id; do
   [[ -n "$id" ]] || continue
+
+  # Bei --limit und --missing maximal die gewünschte Anzahl
+  # Gemini-Anfragen starten. noLLM-Dokumente zählen nicht.
+  if [[ "$mode" != id ]] && (( gemini_requests >= value )); then
+    pm_log INFO "Gemini-Limit erreicht: $gemini_requests Anfragen"
+    break
+  fi
+
+  target_proposal="$PM_STATE/proposals/${id}.json"
+
+  # Bei regulären Läufen nur Dokumente ohne gültiges Proposal
+  # berücksichtigen. --id bleibt eine gezielte Einzelanalyse.
+  if [[ "$mode" != id ]] &&
+     [[ -f "$target_proposal" ]] &&
+     jq -e --argjson id "$id" '
+       .document_id == $id
+       and (.proposal | type == "object")
+     ' "$target_proposal" >/dev/null 2>&1; then
+    pm_log INFO "Dokument $id übersprungen: Proposal bereits vorhanden"
+    continue
+  fi
 
   pm_log INFO "Lese Dokument $id"
 
@@ -148,12 +126,57 @@ if ! jq -e '.tags | type == "array"' \
   continue
 fi
 
-# Dokumente mit noLLM grundsätzlich nicht an Gemini senden.
+# noLLM: niemals Gemini aufrufen; fehlendes Proposal fuer
+# manuelle Bearbeitung erzeugen.
 if [[ -n "$NO_LLM_TAG_ID" ]] && jq -e --argjson tag_id "$NO_LLM_TAG_ID" \
     '(.tags | index($tag_id)) != null' \
     "$document_file" >/dev/null; then
+
+  target_proposal="$PM_STATE/proposals/${id}.json"
+
+  if [[ -f "$target_proposal" ]] &&
+     jq -e . "$target_proposal" >/dev/null 2>&1; then
+    pm_log INFO "Dokument $id: vorhandenes Proposal bleibt unveraendert"
+  else
+    jq -n \
+      --slurpfile document "$document_file" \
+      --arg generated "$(date -Is)" \
+      '($document[0]) as $document
+       | {
+          document_id: $document.id,
+          existing: {
+            title: $document.title,
+            created: $document.created,
+            original_file_name: $document.original_file_name,
+            archived_file_name: $document.archived_file_name,
+            correspondent: $document.correspondent,
+            tags: $document.tags,
+            document_type: $document.document_type
+          },
+          analysis: {
+            ocr_char_count: (($document.content // "") | length),
+            ocr_sent_char_count: 0
+          },
+          proposal: {
+            requires_review: true,
+            review_decision: "manual_check",
+            validation_warnings: [
+              "Tag noLLM: keine Gemini-Analyse; manuelle Bearbeitung erforderlich"
+            ],
+            reason: "Manuelle Bearbeitung erforderlich: Dokument ist mit noLLM markiert."
+          },
+          provider: "none",
+          model: "manual-noLLM",
+          generated_at: $generated,
+          applied: false
+        }' |
+      pm_atomic_json "$target_proposal"
+
+    pm_log INFO "Dokument $id: manuelles noLLM-Placeholder-Proposal gespeichert"
+  fi
+
   rm -f "$document_file" "$request_file" "$proposal_file"
-  pm_log INFO "Dokument $id wegen Tag noLLM übersprungen"
+  ((processed+=1))
   continue
 fi
 
@@ -184,6 +207,12 @@ fi
         existing_document_types: ($types[0] | map({id, name}))
       }' > "$request_file"
   request="$(cat "$request_file")"
+
+  # Nur tatsächliche Gemini-Anfragen zählen.
+  # Der Zähler wird auch bei einem fehlgeschlagenen Aufruf erhöht,
+  # damit das Limit pro Lauf eingehalten wird.
+  ((gemini_requests+=1))
+  pm_log INFO "Gemini-Anfrage $gemini_requests/$value für Dokument $id"
 
   if ! proposal="$(pm_llm_classify "$request")"; then
     pm_log ERROR "KI-Anfrage für Dokument $id fehlgeschlagen"
@@ -309,5 +338,5 @@ fi
   ((processed+=1))
 done <<< "$ids"
 
-pm_log INFO "Abgeschlossen: $processed Vorschläge, $failed Fehler"
+pm_log INFO "Abgeschlossen: $processed Vorschläge, $failed Fehler, $gemini_requests Gemini-Anfragen"
 ((failed == 0))

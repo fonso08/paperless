@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Read-only: OCR-Inhalte und Metadaten lesen; Vorschläge über Gemini erzeugen.
 # Speichert zusätzlich die OCR-Textlänge.
-# Aufruf: ./scripts/01_analyze.sh [--id NUMMER | --limit ANZAHL]
+# Aufruf: ./scripts/01_analyze_doc.sh [--id NUMMER | --limit ANZAHL]
 
 set -euo pipefail
 
@@ -13,7 +13,7 @@ value=10
 
 if (( $# > 0 )); then
   if (( $# != 2 )); then
-    echo 'Aufruf: 01_analyze.sh [--id NUMMER | --limit ANZAHL | --missing ANZAHL]' >&2
+    echo 'Aufruf: 01_analyze_doc.sh [--id NUMMER | --limit ANZAHL | --missing ANZAHL]' >&2
     exit 2
   fi
 
@@ -50,6 +50,77 @@ flock -n 9 || {
   exit 1
 }
 
+
+# ------------------------------------------------------------
+# Index der bereits analysierten Dokumente
+# ------------------------------------------------------------
+
+ANALYZED_IDS_FILE="$PM_STATE/analyzed_ids.json"
+declare -A ANALYZED_IDS=()
+
+rebuild_analyzed_index() {
+  local file base id
+  local ids_tmp
+
+  ids_tmp="$(mktemp "${TMPDIR:-/tmp}/pm-analyzed-ids.XXXXXX")"
+
+  # Nur gültige Proposal-Dateien übernehmen.
+  shopt -s nullglob
+  for file in "$PM_STATE"/proposals/*.json; do
+    base="${file##*/}"
+    id="${base%.json}"
+
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+
+    if jq -e --argjson id "$id" '
+      .document_id == $id
+      and (.proposal | type == "object")
+    ' "$file" >/dev/null 2>&1; then
+      printf '%s\n' "$id" >> "$ids_tmp"
+    fi
+  done
+  shopt -u nullglob
+
+  # IDs numerisch als JSON-Array speichern.
+  jq -Rsc '
+    split("\n")
+    | map(select(length > 0) | tonumber)
+    | unique
+  ' "$ids_tmp" | pm_atomic_json "$ANALYZED_IDS_FILE"
+
+  rm -f "$ids_tmp"
+  pm_log INFO "Analyseindex neu aufgebaut: $(jq 'length' "$ANALYZED_IDS_FILE") IDs"
+}
+
+save_analyzed_index() {
+  printf '%s\n' "${!ANALYZED_IDS[@]}" |
+    sort -n |
+    jq -Rsc '
+      split("\n")
+      | map(select(length > 0) | tonumber)
+      | unique
+    ' |
+    pm_atomic_json "$ANALYZED_IDS_FILE"
+}
+
+# Fehlt der Index oder ist er ungültig, einmalig neu aufbauen.
+if [[ ! -f "$ANALYZED_IDS_FILE" ]] ||
+   ! jq -e '
+     type == "array"
+     and all(.[]; type == "number" and floor == . and . > 0)
+   ' "$ANALYZED_IDS_FILE" >/dev/null 2>&1; then
+  pm_log INFO "Analyseindex fehlt oder ist ungültig; baue ihn neu auf"
+  rebuild_analyzed_index
+fi
+
+# Index in eine Bash-Map laden: schnelle Prüfung im Speicher.
+while IFS= read -r analyzed_id; do
+  [[ "$analyzed_id" =~ ^[0-9]+$ ]] || continue
+  ANALYZED_IDS["$analyzed_id"]=1
+done < <(jq -r '.[]' "$ANALYZED_IDS_FILE")
+
+
+
 # Kataloge sind notwendig für aussagekräftige KI-Vorschläge.
 for resource in tags correspondents document_types; do
   pm_paperless_catalog "$resource" |
@@ -67,51 +138,65 @@ else
   pm_log WARN "Tag noLLM fehlt; Gemini-Verarbeitung läuft ohne Tag-Filter weiter"
 fi
 
+
 if [[ "$mode" == id ]]; then
   ids="$value"
 else
-  all_ids="$(pm_paperless_all_ids)"
-  if [[ "$mode" == missing ]]; then
-  ids=""
-  selected=0
-
-  while IFS= read -r candidate; do
-    [[ "$candidate" =~ ^[0-9]+$ ]] || continue
-
-    proposal_file="$PM_STATE/proposals/${candidate}.json"
-
-    # Bereits analysierte Dokumente überspringen.
-    if [[ -f "$proposal_file" ]] &&
-      jq -e --argjson id "$candidate" '
-        .document_id == $id
-        and (.proposal | type == "object")
-      ' "$proposal_file" >/dev/null 2>&1; then
-      continue
-    fi
-
-    if [[ -n "$ids" ]]; then
-      ids+=$'\n'
-    fi
-
-    ids+="$candidate"
-    ((selected+=1))
-
-    if (( selected >= value )); then
-      break
-    fi
-  done <<< "$all_ids"
-
-  pm_log INFO "Fehlende Vorschläge ohne noLLM ausgewählt: $selected"
-  else
-    ids="$(printf '%s\n' "$all_ids" | sed -n "1,${value}p")"
-  fi
+  # Alle Paperless-IDs holen; die Auswahl geeigneter Dokumente
+  # erfolgt in der Verarbeitung anhand des Index.
+  ids="$(pm_paperless_all_ids)"
 fi
 
 processed=0
 failed=0
+gemini_requests=0
 
 while IFS= read -r id; do
   [[ -n "$id" ]] || continue
+
+
+  # Bereits indexierte Dokumente nicht erneut prüfen.
+  if [[ "$mode" != id ]] && [[ -n "${ANALYZED_IDS[$id]:-}" ]]; then
+    continue
+  fi
+
+  target_proposal="$PM_STATE/proposals/${id}.json"
+
+  # Schutz gegen Abbruch nach dem Speichern eines Proposals,
+  # aber vor der letzten Indexaktualisierung.
+  if [[ "$mode" != id ]] &&
+     [[ -f "$target_proposal" ]] &&
+     jq -e --argjson id "$id" '
+       .document_id == $id
+       and (.proposal | type == "object")
+     ' "$target_proposal" >/dev/null 2>&1; then
+    ANALYZED_IDS["$id"]=1
+    save_analyzed_index
+    pm_log INFO "Dokument $id: gültiges Proposal nachträglich indexiert"
+    continue
+  fi
+
+
+  # Bei --limit und --missing maximal die gewünschte Anzahl
+  # Gemini-Anfragen starten. noLLM-Dokumente zählen nicht.
+  if [[ "$mode" != id ]] && (( gemini_requests >= value )); then
+    pm_log INFO "Gemini-Limit erreicht: $gemini_requests Anfragen"
+    break
+  fi
+
+  target_proposal="$PM_STATE/proposals/${id}.json"
+
+  # Bei regulären Läufen nur Dokumente ohne gültiges Proposal
+  # berücksichtigen. --id bleibt eine gezielte Einzelanalyse.
+  if [[ "$mode" != id ]] &&
+     [[ -f "$target_proposal" ]] &&
+     jq -e --argjson id "$id" '
+       .document_id == $id
+       and (.proposal | type == "object")
+     ' "$target_proposal" >/dev/null 2>&1; then
+    pm_log INFO "Dokument $id übersprungen: Proposal bereits vorhanden"
+    continue
+  fi
 
   pm_log INFO "Lese Dokument $id"
 
@@ -145,7 +230,10 @@ if [[ -n "$NO_LLM_TAG_ID" ]] && jq -e --argjson tag_id "$NO_LLM_TAG_ID" \
   target_proposal="$PM_STATE/proposals/${id}.json"
 
   if [[ -f "$target_proposal" ]] &&
-     jq -e . "$target_proposal" >/dev/null 2>&1; then
+     jq -e --argjson id "$id" '
+       .document_id == $id
+       and (.proposal | type == "object")
+     ' "$target_proposal" >/dev/null 2>&1; then
     pm_log INFO "Dokument $id: vorhandenes Proposal bleibt unveraendert"
   else
     jq -n \
@@ -185,9 +273,14 @@ if [[ -n "$NO_LLM_TAG_ID" ]] && jq -e --argjson tag_id "$NO_LLM_TAG_ID" \
     pm_log INFO "Dokument $id: manuelles noLLM-Placeholder-Proposal gespeichert"
   fi
 
+  # noLLM wurde manuell abgelegt oder war bereits gültig.
+  ANALYZED_IDS["$id"]=1
+  save_analyzed_index
+
   rm -f "$document_file" "$request_file" "$proposal_file"
   ((processed+=1))
   continue
+
 fi
 
 
@@ -217,6 +310,12 @@ fi
         existing_document_types: ($types[0] | map({id, name}))
       }' > "$request_file"
   request="$(cat "$request_file")"
+
+  # Nur tatsächliche Gemini-Anfragen zählen.
+  # Der Zähler wird auch bei einem fehlgeschlagenen Aufruf erhöht,
+  # damit das Limit pro Lauf eingehalten wird.
+  ((gemini_requests+=1))
+  pm_log INFO "Gemini-Anfrage $gemini_requests/$value für Dokument $id"
 
   if ! proposal="$(pm_llm_classify "$request")"; then
     pm_log ERROR "KI-Anfrage für Dokument $id fehlgeschlagen"
@@ -285,17 +384,8 @@ fi
         else empty end
       ] as $warnings
     | .validation_warnings = $warnings
-    | .requires_review =
-        (($warnings | length) > 0)
-        or ($p.requires_review == true
-            and ($p.reason | startswith("Prüfgrund:")))
-    | .review_decision =
-        if .requires_review == true
-        then "manual_check"
-        elif .confidence < 0.75
-        then "inconclusive"
-        else "no_check_needed"
-        end
+    | .requires_review = false
+    | .review_decision = "no_check_needed"
   ' <<< "$proposal")"
 
   if jq -e '.validation_warnings | length > 0' >/dev/null <<< "$proposal"; then
@@ -337,10 +427,98 @@ fi
     }' |
     pm_atomic_json "$PM_STATE/proposals/${id}.json"
 
+# Gemini-Vorsch-Vorschlag für das Apply-Script vormerken.
+APPLY_INDEX="$PM_STATE/apply_candidates.json"
+mkdir -p "$PM_STATE"
+
+# Fehlenden oder ungültigen Index initialisieren.
+if [[ ! -f "$APPLY_INDEX" ]] ||
+   ! jq -e '
+     type == "array" and
+     all(.[]; type == "number" and floor == . and . > 0)
+   ' "$APPLY_INDEX" >/dev/null 2>&1; then
+
+  echo "[INFO] Apply-Index fehlt oder ist ungültig; baue ihn neu auf."
+
+  index_tmp="$(mktemp "${TMPDIR:-/tmp}/pm-apply-index.XXXXXX")"
+  proposal_ids_tmp="$(mktemp "${TMPDIR:-/tmp}/pm-apply-ids.XXXXXX")"
+
+  shopt -s nullglob
+  for proposal_file in "$PM_STATE"/proposals/*.json; do
+    jq -er '
+      select(
+        .applied != true and
+        (.document_id | numbers) and
+        (.proposal | type == "object") and
+        (.model != "manual-noLLM") and
+        (.provider != "none") and
+        ((.proposal.primary_tag // "") | type == "string" and length > 0)
+      ) | .document_id
+    ' "$proposal_file" 2>/dev/null >> "$proposal_ids_tmp" || true
+  done
+  shopt -u nullglob
+
+  if ! sort -nu "$proposal_ids_tmp" |
+       jq -Rsc '
+         split("\n")
+         | map(select(test("^[0-9]+$")) | tonumber)
+       ' > "$index_tmp"; then
+    rm -f "$index_tmp" "$proposal_ids_tmp"
+    echo "[FEHLER] Apply-Index konnte nicht aufgebaut werden." >&2
+    exit 1
+  fi
+
+  if ! jq -e '
+    type == "array" and
+    all(.[]; type == "number" and floor == . and . > 0)
+  ' "$index_tmp" >/dev/null; then
+    rm -f "$index_tmp" "$proposal_ids_tmp"
+    echo "[FEHLER] Neu aufgebauter Apply-Index ist ungültig." >&2
+    exit 1
+  fi
+
+  mv "$index_tmp" "$APPLY_INDEX"
+  rm -f "$proposal_ids_tmp"
+fi
+
+# Aktuelle Dokument-ID immer ergänzen, falls sie noch fehlt.
+index_tmp="$(mktemp "${TMPDIR:-/tmp}/pm-apply-add.XXXXXX")"
+
+if ! jq --argjson id "$id" '
+  if index($id) == null then . + [$id] else . end
+  | sort
+  | unique
+' "$APPLY_INDEX" > "$index_tmp"; then
+  rm -f "$index_tmp"
+  echo "[FEHLER] Dokument $id: Apply-Index konnte nicht aktualisiert werden." >&2
+  exit 1
+fi
+
+if ! jq -e '
+  type == "array" and
+  all(.[]; type == "number" and floor == . and . > 0)
+' "$index_tmp" >/dev/null; then
+  rm -f "$index_tmp"
+  echo "[FEHLER] Dokument $id: neuer Apply-Index ist ungültig." >&2
+  exit 1
+fi
+
+if ! mv "$index_tmp" "$APPLY_INDEX"; then
+  rm -f "$index_tmp"
+  echo "[FEHLER] Dokument $id: Apply-Index konnte nicht gespeichert werden." >&2
+  exit 1
+fi
+
+echo "[INFO] Dokument $id zum Apply-Index hinzugefügt."
+
+  # Erst nach erfolgreichem Speichern des Proposals indexieren.
+  ANALYZED_IDS["$id"]=1
+  save_analyzed_index
+
   rm -f "$document_file" "$request_file" "$proposal_file"
-  pm_log INFO "Vorschlag gespeichert: Dokument $id (keine Änderungen an Paperless)"
+  pm_log INFO "Vorschlag gespeichert und indexiert: Dokument $id (keine Änderungen an Paperless)"
   ((processed+=1))
 done <<< "$ids"
 
-pm_log INFO "Abgeschlossen: $processed Vorschläge, $failed Fehler"
+pm_log INFO "Abgeschlossen: $processed Vorschläge, $failed Fehler, $gemini_requests Gemini-Anfragen"
 ((failed == 0))
