@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Exportiert Paperless-Dokumente, die im Google-Drive-Archiv noch fehlen.
-# Standard: Dry-Run. Tatsächlicher Upload nur mit --apply.
+# Standard: tatsächlicher Export. Dry-Run nur mit --dry-run.
 # WICHTIG: Dieses Skript löscht weder Paperless-Originale noch GDrive-Dateien.
 set -Eeuo pipefail
 
@@ -11,25 +11,54 @@ source "${SCRIPT_DIR}/lib/paperless_api.sh"
 init_directories
 check_common_requirements
 
-APPLY=false
+# Standard: tatsächlicher Export
+APPLY=true
 INIT=false
-case "${1:-}" in
-  "") ;;
-  --apply) APPLY=true ;;
-  --init) APPLY=true; INIT=true ;;
-  -h|--help)
-    cat <<'HELP'
-Verwendung: 04_export_missing_archive.sh [--apply|--init]
-Ohne Option: Dry-Run, zeigt nur fehlende Archivdateien.
---apply: Exportiert nur Dokumente, die noch nicht im Archiv erkannt werden.
---init: Fragt einmal nach und exportiert danach ALLE Paperless-Dokumente.
-       Vorhandene Zieldateien werden überschrieben.
+DRY_RUN=false
+
+while (($#)); do
+  case "$1" in
+    --apply)
+      APPLY=true
+      DRY_RUN=false
+      ;;
+    --dry-run)
+      APPLY=false
+      DRY_RUN=true
+      ;;
+    --init)
+      APPLY=true
+      INIT=true
+      DRY_RUN=false
+      ;;
+    -h|--help)
+      cat <<'HELP'
+Verwendung: 04_export_archive.sh [--apply|--dry-run|--init]
+
+Ohne Option:
+  Exportiert fehlende Dokumente tatsächlich.
+
+--apply:
+  Exportiert fehlende Dokumente tatsächlich.
+
+--dry-run:
+  Zeigt fehlende Dokumente an, ohne sie hochzuladen.
+
+--init:
+  Exportiert nach Sicherheitsabfrage alle Dokumente erneut.
+  Vorhandene Zieldateien können überschrieben werden.
+
 Es werden keine Quellen gelöscht und keine Paperless-Metadaten verändert.
 HELP
-    exit 0 ;;
-  *) echo "Unbekannte Option: $1" >&2; exit 2 ;;
-esac
-
+      exit 0
+      ;;
+    *)
+      echo "Unbekannte Option: $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 if [[ "$INIT" == true ]]; then
   echo "ACHTUNG: --init exportiert ALLE Dokumente aus Paperless-ngx erneut."
   echo "Dateien am berechneten Zielpfad in Google Drive werden dabei ÜBERSCHRIEBEN."
@@ -372,8 +401,8 @@ done
 
 log "Zusammenfassung: geprüft=$seen bereits_archiviert=$already fehlend=$missing exportiert=$exported fehler=$failed"
 
-if [[ "$APPLY" != true ]]; then
-  log "Dry-Run beendet. Für fehlende Dateien --apply, für einen vollständigen Neu-Export --init verwenden."
+if [[ "$DRY_RUN" == true ]]; then
+  log "Dry-Run beendet. Für den tatsächlichen Export das Skript ohne Option oder mit --apply starten."
 fi
 
 (( failed == 0 )) || exit 1
